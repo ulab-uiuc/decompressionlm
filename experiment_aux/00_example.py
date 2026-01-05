@@ -1,6 +1,6 @@
 """
 Example script showing how to use decompressionLM to estimate entropy.
-Replicates the examples from decompress.py's main function.
+Replicates the examples from decompress.py's main function with parallel batching.
 """
 
 import torch
@@ -34,22 +34,26 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prefix="What is the capital of France?",
-        max_samples=500,
+        max_samples=131072,
         max_len=32,
         model_name=model_name,
-        variance_threshold=1e-3,
-        offset=0.0
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,  # Smaller batch for short sequences
+        display_interval=128,  # Update every 2 batches
     )
     
     reasoning = estimate_entropy(
         model=model,
         tokenizer=tokenizer,
         prefix="What are common ways to solve a coding challenge?",
-        max_samples=1000,
+        max_samples=131072,
         max_len=32,
         model_name=model_name,
-        variance_threshold=1e-3,
-        offset=0.0
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,
+        display_interval=128,
     )
     
     print(f"\nFactual entropy:   {factual['entropy_bits']:.2f} bits (EOS rate: {factual['eos_rate']:.1%}, samples: {factual['n_samples']})")
@@ -70,12 +74,14 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prefix="What are some concepts that are important for the GNU assembler (GAS)?",
-        max_samples=1000,
+        max_samples=131072,
         max_len=64,
         save_path="results/gas_question.parquet",
         model_name=model_name,
-        variance_threshold=1e-3,
-        offset=0.0
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,  # Larger batch for medium sequences
+        display_interval=256,  # Update every 2 batches
     )
 
     print()
@@ -93,22 +99,26 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prefix="What is programming?",
-        max_samples=500,
-        max_len=50,
+        max_samples=131072,
+        max_len=64,
         model_name=model_name,
-        variance_threshold=1e-3,
-        offset=0.0
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,
+        display_interval=128,
     )
     
     specific = estimate_entropy(
         model=model,
         tokenizer=tokenizer,
         prefix="What is the time complexity of quicksort?",
-        max_samples=500,
+        max_samples=131072,
         max_len=64,
         model_name=model_name,
-        variance_threshold=1e-3,
-        offset=0.0
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,
+        display_interval=128,
     )
     
     print(f"\nVague question entropy:    {vague['entropy_bits']:.2f} bits (EOS: {vague['eos_rate']:.1%}, samples: {vague['n_samples']})")

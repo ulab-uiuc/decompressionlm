@@ -1,6 +1,7 @@
 """
 Example script comparing QMC vs IID sampling for entropy estimation.
 Shows convergence speed differences between deterministic low-discrepancy and random sampling.
+Now with parallel batching for massive speedup!
 """
 import torch
 import numpy as np
@@ -11,7 +12,7 @@ import plotext as plt
 
 from src.decompress import estimate_entropy
 from src.vdc import generate_vdc_sequence
-from src.arithmetic import arithmetic_sample_sequence
+from src.arithmetic import parallel_arithmetic_sample_batch
 
 
 def clear_lines(n):
@@ -28,13 +29,24 @@ def estimate_entropy_iid(
     max_len: int = 100,
     use_chat_template: bool = True,
     device: str = "cuda",
-    use_cache: bool = True,
     variance_threshold: float = 1e-4,
+    batch_size: int = 128,
+    display_interval: int = 128,
 ) -> Dict:
     """
-    Estimate H(X | prefix) using IID (random) sampling with early stopping.
+    Estimate H(X | prefix) using IID (random) sampling with early stopping and parallel batching.
     Same logic as QMC version but with random codes instead of Van der Corput.
     """
+    
+    # Validate parameters
+    if display_interval < 0:
+        raise ValueError("display_interval must be >= 0")
+    
+    if display_interval > 0:
+        if display_interval < batch_size:
+            raise ValueError(f"display_interval ({display_interval}) must be >= batch_size ({batch_size})")
+        if display_interval % batch_size != 0:
+            raise ValueError(f"display_interval ({display_interval}) must be a multiple of batch_size ({batch_size})")
     
     # Prepare prefix
     if prefix == "":
@@ -65,8 +77,10 @@ def estimate_entropy_iid(
     eos_count = 0
     sum_log_probs = 0.0
 
-    print(f"Sampling sequences for prefix: '{prefix}' with early stopping [{sampling_method}]")
+    print(f"Sampling sequences for prefix: '{prefix}' with parallel batching [{sampling_method}]")
     print(f"Max samples       : {max_samples}")
+    print(f"Batch size        : {batch_size}")
+    print(f"Display interval  : {display_interval if display_interval > 0 else 'disabled (final only)'}")
     print(f"Variance threshold: {variance_threshold}")
 
     start_time = time.time()
@@ -74,29 +88,35 @@ def estimate_entropy_iid(
     converged = False
     samples_done = 0
 
-    for i, code in enumerate(codes):
-        tokens, log_prob, sample_info = arithmetic_sample_sequence(
+    # Process in batches
+    for batch_start in range(0, max_samples, batch_size):
+        batch_end = min(batch_start + batch_size, max_samples)
+        batch_codes = codes[batch_start:batch_end]
+        
+        # Generate batch in parallel
+        batch_results = parallel_arithmetic_sample_batch(
             model=model,
             tokenizer=tokenizer,
             prefix_ids=prefix_ids,
-            code=code,
+            codes=batch_codes,
             max_len=max_len,
-            device=device,
-            use_cache=use_cache
+            device=device
         )
-
-        log_probs.append(log_prob)
-        sequences.append(tokens)
-        sum_log_probs += log_prob
         
-        if sample_info['terminated_with_eos']:
-            eos_count += 1
-
-        samples_done = i + 1
-        current_entropy = -sum_log_probs / samples_done
-        current_entropy_bits = current_entropy / torch.log(torch.tensor(2.0)).item()
-        entropy_history.append(current_entropy_bits)
-
+        # Collect results from batch
+        for tokens, log_prob, sample_info in batch_results:
+            log_probs.append(log_prob)
+            sequences.append(tokens)
+            sum_log_probs += log_prob
+            
+            if sample_info['terminated_with_eos']:
+                eos_count += 1
+            
+            samples_done += 1
+            current_entropy = -sum_log_probs / samples_done
+            current_entropy_bits = current_entropy / torch.log(torch.tensor(2.0)).item()
+            entropy_history.append(current_entropy_bits)
+        
         # Check early stopping condition
         if samples_done >= 20:
             half_point = (samples_done - 1) // 2 + 1
@@ -109,15 +129,20 @@ def estimate_entropy_iid(
                     converged = True
                     break
 
-        elapsed = time.time() - start_time
-        samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
-        samples_left = max_samples - samples_done
-        max_eta_sec = samples_left / samples_per_sec if samples_per_sec > 0 else 0
-
-        if samples_done % 10 == 0:
+        # Display update
+        should_display = (display_interval > 0 and samples_done % display_interval == 0)
+        
+        if should_display:
+            elapsed = time.time() - start_time
+            samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
+            samples_left = max_samples - samples_done
+            max_eta_sec = samples_left / samples_per_sec if samples_per_sec > 0 else 0
+            
+            # Clear previous display
             if last_plot_lines > 0:
                 clear_lines(last_plot_lines + 1)
-
+            
+            # Plot
             plt.clf()
             plt.plot(range(1, len(entropy_history) + 1), entropy_history)
             plt.title(f"{sampling_method} Entropy Convergence")
@@ -125,16 +150,17 @@ def estimate_entropy_iid(
             plt.ylabel("Entropy (bits)")
             plt.plotsize(100, 20)
             plt.show()
-
+            
             last_plot_lines = 20
-
+            
+            # Stats line
             elapsed_min = int(elapsed // 60)
             elapsed_sec = int(elapsed % 60)
             max_eta_min = int(max_eta_sec // 60)
             max_eta_sec_remainder = int(max_eta_sec % 60)
             eos_rate = eos_count / samples_done
             
-            # Show variance status
+            # Variance status
             if samples_done >= 20:
                 half_point = (samples_done - 1) // 2 + 1
                 second_half_entropy = entropy_history[half_point:]
@@ -156,10 +182,18 @@ def estimate_entropy_iid(
                 f"{var_status}"
             )
 
-    # Display final plot
-    if last_plot_lines > 0:
+    # Display final plot and stats
+    elapsed = time.time() - start_time
+    samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
+    eos_rate = eos_count / samples_done
+    current_entropy = -sum_log_probs / samples_done
+    current_entropy_bits = current_entropy / torch.log(torch.tensor(2.0)).item()
+    
+    # Clear previous display if it exists (only if display_interval > 0)
+    if display_interval > 0 and last_plot_lines > 0:
         clear_lines(last_plot_lines + 1)
     
+    # Final plot
     plt.clf()
     plt.plot(range(1, len(entropy_history) + 1), entropy_history)
     plt.title(f"{sampling_method} Entropy Convergence - FINAL")
@@ -168,22 +202,19 @@ def estimate_entropy_iid(
     plt.plotsize(100, 20)
     plt.show()
     
-    # Print final status
-    elapsed = time.time() - start_time
+    # Final stats
     elapsed_min = int(elapsed // 60)
     elapsed_sec = int(elapsed % 60)
-    eos_rate = eos_count / samples_done
-    samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
     
-    half_point = (samples_done - 1) // 2 + 1
-    second_half_entropy = entropy_history[half_point:]
-    entropy_variance = np.var(second_half_entropy)
-    var_status = f"Var: {entropy_variance:.6f}"
-
-    if converged:
-        status = "CONVERGENCE"
+    if samples_done >= 20:
+        half_point = (samples_done - 1) // 2 + 1
+        second_half_entropy = entropy_history[half_point:]
+        entropy_variance = np.var(second_half_entropy)
+        var_status = f"Var: {entropy_variance:.6f}"
     else:
-        status = "NO CONVERGENCE"
+        var_status = "N/A (< 20 samples)"
+    
+    status = "CONVERGENCE" if converged else "NO CONVERGENCE"
     
     print(
         f"[{status}] [{samples_done}/{max_samples}] "
@@ -239,11 +270,13 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prefix=prefix,
-        max_samples=10000,
+        max_samples=131072,
         max_len=32,
         model_name=model_name,
         variance_threshold=5e-4,
-        offset=0.0
+        offset=0.0,
+        batch_size=128,
+        display_interval=256,
     )
     
     print("\n--- IID Sampling (Random) ---")
@@ -251,9 +284,11 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prefix=prefix,
-        max_samples=10000,
+        max_samples=131072,
         max_len=32,
         variance_threshold=5e-4,
+        batch_size=128,
+        display_interval=256,
     )
     
     print("\n" + "="*60)
@@ -275,11 +310,13 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prefix=prefix,
-        max_samples=10000,
+        max_samples=131072,
         max_len=32,
         model_name=model_name,
-        variance_threshold=1e-2,
-        offset=0.0
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,
+        display_interval=256,
     )
     
     print("\n--- IID Sampling (Random) ---")
@@ -287,9 +324,11 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prefix=prefix,
-        max_samples=10000,
+        max_samples=131072,
         max_len=32,
-        variance_threshold=1e-2,
+        variance_threshold=5e-4,
+        batch_size=128,
+        display_interval=256,
     )
     
     print("\n" + "="*60)
@@ -311,11 +350,13 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prefix=prefix,
-        max_samples=10000,
+        max_samples=131072,
         max_len=64,
         model_name=model_name,
-        variance_threshold=1e-2,
-        offset=0.0
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,
+        display_interval=256,
     )
     
     print("\n--- IID Sampling (Random) ---")
@@ -323,9 +364,11 @@ def main():
         model=model,
         tokenizer=tokenizer,
         prefix=prefix,
-        max_samples=10000,
+        max_samples=131072,
         max_len=64,
-        variance_threshold=1e-2,
+        variance_threshold=5e-4,
+        batch_size=128,
+        display_interval=256,
     )
     
     print("\n" + "="*60)

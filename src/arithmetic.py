@@ -50,6 +50,156 @@ def arithmetic_sample_token(logits: torch.Tensor, code: float) -> Tuple[int, flo
     return token_id, token_logp, rescaled_code
 
 
+def arithmetic_sample_token_batch(logits: torch.Tensor, codes: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Sample tokens for a batch using arithmetic coding with deterministic codes.
+    
+    Args:
+        logits: Logits over vocab [batch_size, vocab_size]
+        codes: Deterministic codes in [0, 1) [batch_size]
+        
+    Returns:
+        token_ids: Sampled token indices [batch_size]
+        log_probs: Log probabilities of sampled tokens [batch_size]
+        rescaled_codes: Codes rescaled to subintervals [batch_size]
+    """
+    batch_size = logits.shape[0]
+    device = logits.device
+    
+    # Clamp codes to [0, 1)
+    codes = torch.clamp(codes, min=0.0, max=1.0 - 1e-16)
+    
+    # Numerically stable: log_softmax in fp32
+    log_probs_all = torch.log_softmax(logits.float(), dim=-1)  # [B, V]
+    probs = log_probs_all.exp()
+    
+    # Accurate CDF computation in fp64
+    cdf = torch.cumsum(probs.double(), dim=-1)  # [B, V]
+    cdf[:, -1] = 1.0  # Fix floating point errors
+    
+    # Find which interval each code falls into
+    token_ids = torch.searchsorted(cdf, codes.unsqueeze(1).double()).squeeze(1)  # [B]
+    
+    # Gather log probs for sampled tokens
+    log_probs = log_probs_all.gather(1, token_ids.unsqueeze(1)).squeeze(1)  # [B]
+    
+    # Get interval bounds [m, M) for sampled tokens
+    # m: left boundary (0 for first token, otherwise cdf[i-1])
+    m = torch.zeros(batch_size, dtype=torch.float64, device=device)
+    valid_mask = token_ids > 0
+    if valid_mask.any():
+        m[valid_mask] = cdf[valid_mask, token_ids[valid_mask] - 1]
+    
+    # M: right boundary
+    M = cdf.gather(1, token_ids.unsqueeze(1)).squeeze(1)  # [B]
+    
+    # Rescale codes to subintervals
+    denom = M - m
+    rescaled_codes = torch.where(
+        denom == 0,
+        torch.zeros_like(codes),
+        (codes.double() - m) / denom
+    ).float()
+    
+    return token_ids, log_probs, rescaled_codes
+
+
+def parallel_arithmetic_sample_batch(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prefix_ids: torch.Tensor,
+    codes: List[float],
+    max_len: int = 100,
+    device: str = "cuda",
+) -> List[Tuple[List[int], float, dict]]:
+    """
+    Sample multiple sequences in parallel using batched forward passes.
+    
+    Args:
+        model: Language model
+        tokenizer: Tokenizer
+        prefix_ids: Input token IDs [1, seq_len]
+        codes: List of deterministic codes in [0, 1)
+        max_len: Maximum generation length per sample
+        device: Device to run on
+        
+    Returns:
+        List of (tokens, total_log_prob, info) for each sequence
+    """
+    batch_size = len(codes)
+    model.eval()
+    
+    # Expand prefix for batch [B, prefix_len]
+    input_ids = prefix_ids.repeat(batch_size, 1).to(device)
+    
+    # Track state for each sequence
+    active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+    current_codes = torch.tensor(codes, dtype=torch.float32, device=device)
+    generated_tokens = [[] for _ in range(batch_size)]
+    total_log_probs = torch.zeros(batch_size, device=device)
+    per_seq_log_probs = [[] for _ in range(batch_size)]
+    
+    with torch.no_grad():
+        # Initial forward pass with shared prefix
+        outputs = model(input_ids, use_cache=True)
+        past_key_values = outputs.past_key_values
+        logits = outputs.logits[:, -1, :]  # [B, vocab_size]
+        
+        for step in range(max_len):
+            # Sample for all active sequences using batched operation
+            token_ids_batch, log_probs_batch, new_codes = arithmetic_sample_token_batch(
+                logits, current_codes
+            )
+            
+            # Update state for each sequence
+            for i in range(batch_size):
+                if active_mask[i]:
+                    tid = token_ids_batch[i].item()
+                    lp = log_probs_batch[i].item()
+                    
+                    per_seq_log_probs[i].append(lp)
+                    total_log_probs[i] += lp
+                    
+                    if tid == tokenizer.eos_token_id:
+                        active_mask[i] = False
+                    else:
+                        generated_tokens[i].append(tid)
+            
+            current_codes = new_codes
+            
+            # Early exit if all sequences terminated
+            if not active_mask.any():
+                break
+            
+            # Prepare next tokens for ALL sequences (use padding for inactive)
+            # This is simpler and avoids cache slicing issues
+            next_tokens = token_ids_batch.unsqueeze(1)  # [B, 1]
+            
+            # Forward pass with full batch
+            outputs = model(
+                next_tokens,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+            
+            past_key_values = outputs.past_key_values
+            logits = outputs.logits[:, -1, :]  # [B, vocab_size]
+            
+            # Zero out logits for inactive sequences (they won't be used anyway)
+            logits[~active_mask] = 0.0
+    
+    # Package results
+    results = []
+    for i in range(batch_size):
+        info = {
+            'per_token_log_probs': per_seq_log_probs[i],
+            'num_tokens': len(generated_tokens[i]),
+            'terminated_with_eos': len(generated_tokens[i]) == 0 or not active_mask[i]
+        }
+        results.append((generated_tokens[i], total_log_probs[i].item(), info))
+    
+    return results
+
 def arithmetic_sample_sequence(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -61,6 +211,9 @@ def arithmetic_sample_sequence(
 ) -> Tuple[list[int], float, dict]:
     """
     Sample a complete sequence autoregressively using arithmetic coding.
+    
+    NOTE: This is the legacy sequential version. Use parallel_arithmetic_sample_batch
+    for better GPU utilization.
     
     Args:
         model: Language model
@@ -76,86 +229,17 @@ def arithmetic_sample_sequence(
         total_log_prob: Sum of log probabilities INCLUDING EOS if encountered
         info: Dict with 'per_token_log_probs', 'num_tokens', 'terminated_with_eos'
     """
-    model.eval()
-    input_ids = prefix_ids.to(device)
-    generated_tokens = []
-    total_log_prob = 0.0
-    per_token_log_probs = []
+    # Just use the batched version with batch_size=1
+    results = parallel_arithmetic_sample_batch(
+        model=model,
+        tokenizer=tokenizer,
+        prefix_ids=prefix_ids,
+        codes=[code],
+        max_len=max_len,
+        device=device
+    )
     
-    # Start with initial code, will be rescaled at each step
-    current_code = code
-    terminated_with_eos = False
-    
-    with torch.no_grad():
-        if use_cache:
-            # First pass: get initial logits and cache
-            outputs = model(input_ids, use_cache=True)
-            past_key_values = outputs.past_key_values
-            next_token_logits = outputs.logits[:, -1, :].squeeze(0)  # [vocab_size]
-            
-            for step in range(max_len):
-                # Sample using arithmetic coding
-                token_id, log_prob, current_code = arithmetic_sample_token(
-                    next_token_logits, current_code
-                )
-                
-                # Always include log_prob for proper sequence probability
-                per_token_log_probs.append(log_prob)
-                total_log_prob += log_prob
-                
-                # Check for EOS - include its probability but don't add to output
-                if token_id == tokenizer.eos_token_id:
-                    terminated_with_eos = True
-                    break
-                
-                # Add non-EOS tokens to output
-                generated_tokens.append(token_id)
-                
-                # Generate next token using cache (O(1) instead of O(L))
-                outputs = model(
-                    torch.tensor([[token_id]], device=device),
-                    past_key_values=past_key_values,
-                    use_cache=True
-                )
-                past_key_values = outputs.past_key_values
-                next_token_logits = outputs.logits[:, -1, :].squeeze(0)
-        else:
-            # Fallback: no cache (slower O(L²) but simpler)
-            for step in range(max_len):
-                # Get logits for next token
-                outputs = model(input_ids)
-                next_token_logits = outputs.logits[:, -1, :].squeeze(0)  # [vocab_size]
-                
-                # Sample using arithmetic coding and get rescaled code for next step
-                token_id, log_prob, current_code = arithmetic_sample_token(
-                    next_token_logits, current_code
-                )
-                
-                # Always include log_prob for proper sequence probability
-                per_token_log_probs.append(log_prob)
-                total_log_prob += log_prob
-                
-                # Check for EOS - include its probability but don't add to output
-                if token_id == tokenizer.eos_token_id:
-                    terminated_with_eos = True
-                    break
-                
-                # Add non-EOS tokens to output
-                generated_tokens.append(token_id)
-                
-                # Update input for next iteration
-                input_ids = torch.cat([
-                    input_ids,
-                    torch.tensor([[token_id]], device=device)
-                ], dim=1)
-    
-    info = {
-        'per_token_log_probs': per_token_log_probs,
-        'num_tokens': len(generated_tokens),
-        'terminated_with_eos': terminated_with_eos
-    }
-    
-    return generated_tokens, total_log_prob, info
+    return results[0]
 
 
 if __name__ == "__main__":
@@ -185,21 +269,21 @@ if __name__ == "__main__":
     # Encode prefix
     prefix_ids = tokenizer.encode(prompt, return_tensors="pt")
     
-    # Test with a few different codes
+    # Test parallel batching
     from src.vdc import generate_vdc_sequence
     
-    codes = generate_vdc_sequence(100)
-    print("Sampling with different VdC codes:\n")
+    codes = generate_vdc_sequence(1024)
+    print("Testing parallel sampling with 1024 sequences:\n")
     
-    for i, code in enumerate(codes[:5]):  # Just show first 5 for testing
-        tokens, log_prob, info = arithmetic_sample_sequence(
-            model, tokenizer, prefix_ids, code, max_len=128
-        )
-        
+    results = parallel_arithmetic_sample_batch(
+        model, tokenizer, prefix_ids, codes, max_len=128
+    )
+    
+    for i, (tokens, log_prob, info) in enumerate(results):
         text = tokenizer.decode(tokens, skip_special_tokens=True)
-        print(f"Code {i+1} ({code:.4f}):")
-        print(f"  Generated: {text}")
-        print(f"  Total log prob (including EOS): {log_prob:.4f}")
+        print(f"Sequence {i+1}:")
+        print(f"  Generated: {text[:100]}...")
+        print(f"  Total log prob: {log_prob:.4f}")
         print(f"  Num tokens: {info['num_tokens']}")
-        print(f"  EOS encountered: {info['terminated_with_eos']}")
+        print(f"  EOS: {info['terminated_with_eos']}")
         print()
