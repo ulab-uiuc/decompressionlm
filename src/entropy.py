@@ -11,7 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import plotext as plt
 
 from src.vdc import generate_vdc_sequence
-from src.arithmetic import arithmetic_sample_sequence
+from src.arithmetic import parallel_arithmetic_sample_batch
 
 
 def clear_lines(n):
@@ -28,15 +28,17 @@ def estimate_conditional_entropy(
     max_len: int = 100,
     use_chat_template: bool = True,
     device: str = "cuda",
-    use_cache: bool = True,
+    use_cache: bool = True,  # Deprecated, always uses cache in parallel mode
     variance_threshold: float = 1e-4,
-    offset: float = 0.0  # Cranley-Patterson rotation
+    offset: float = 0.0,
+    batch_size: int = 128,
+    display_interval: int = 128,
 ) -> Tuple[float, Dict]:
     """
     Estimate H(X | prefix) using quasi-Monte Carlo sampling with early stopping.
     
     Uses Van der Corput sequence for deterministic low-discrepancy sampling
-    and arithmetic coding to get exact probabilities.
+    and arithmetic coding to get exact probabilities. Now with parallel batching!
     
     Early stopping: Stops when the variance of entropy estimates in the second half
     of samples falls below variance_threshold, or when max_samples is reached.
@@ -55,18 +57,29 @@ def estimate_conditional_entropy(
         max_len: Maximum generation length per sample
         use_chat_template: Whether to format with chat template (ignored if prefix="")
         device: Device to run on
-        use_cache: Whether to use KV cache (highly recommended)
+        use_cache: Deprecated (always True in parallel mode)
         variance_threshold: Stop when variance of entropy in second half < threshold
         offset: Cranley-Patterson rotation offset in [0, 1)
+        batch_size: Number of sequences to generate in parallel (default: 128)
+        display_interval: Update display every N samples (must be 0 or multiple of batch_size)
         
     Returns:
         entropy: Estimated H(X | prefix) in nats
         info: Dict with detailed sampling information
     """
     
-    # Validate offset
+    # Validate parameters
     if not (0.0 <= offset < 1.0):
         raise ValueError("offset must be in [0, 1)")
+    
+    if display_interval < 0:
+        raise ValueError("display_interval must be >= 0")
+    
+    if display_interval > 0:
+        if display_interval < batch_size:
+            raise ValueError(f"display_interval ({display_interval}) must be >= batch_size ({batch_size})")
+        if display_interval % batch_size != 0:
+            raise ValueError(f"display_interval ({display_interval}) must be a multiple of batch_size ({batch_size})")
 
     # Prepare prefix
     if prefix == "":
@@ -108,47 +121,56 @@ def estimate_conditional_entropy(
     entropy_history = []
     eos_count = 0
     sum_log_probs = 0.0  # Running sum for O(N) entropy computation
+    total_tokens = 0  # Track total tokens generated
 
     if prefix == "":
-        print(f"Sampling sequences unconditionally (BOS-only) with early stopping")
+        print(f"Sampling sequences unconditionally (BOS-only) with parallel batching")
     else:
-        print(f"Sampling sequences for prefix: '{prefix}' with early stopping")
+        print(f"Sampling sequences for prefix: '{prefix}' with parallel batching")
+    print(f"Max Seq Length    : {max_len}")
     print(f"Max samples       : {max_samples}")
+    print(f"Batch size        : {batch_size}")
+    print(f"Display interval  : {display_interval if display_interval > 0 else 'disabled (final only)'}")
     print(f"Variance threshold: {variance_threshold}")
     print(f"Offset            : {offset}")
-    print(f"Max Seq Length    : {max_len}")
 
     start_time = time.time()
     last_plot_lines = 0
     converged = False
     samples_done = 0
 
-    for i, code in enumerate(codes):
-        tokens, log_prob, sample_info = arithmetic_sample_sequence(
+    # Process in batches
+    for batch_start in range(0, max_samples, batch_size):
+        batch_end = min(batch_start + batch_size, max_samples)
+        batch_codes = codes[batch_start:batch_end]
+        
+        # Generate batch in parallel
+        batch_results = parallel_arithmetic_sample_batch(
             model=model,
             tokenizer=tokenizer,
             prefix_ids=prefix_ids,
-            code=code,
+            codes=batch_codes,
             max_len=max_len,
-            device=device,
-            use_cache=use_cache
+            device=device
         )
-
-        log_probs.append(log_prob)
-        sequences.append(tokens)
-        sum_log_probs += log_prob  # O(1) update
         
-        if sample_info['terminated_with_eos']:
-            eos_count += 1
-
-        samples_done = i + 1
-        current_entropy = -sum_log_probs / samples_done  # O(1) instead of O(N)
-        current_entropy_bits = current_entropy / torch.log(torch.tensor(2.0)).item()
-        entropy_history.append(current_entropy_bits)
-
-        # Check early stopping condition (need at least 10 samples in second half)
+        # Collect results from batch
+        for tokens, log_prob, sample_info in batch_results:
+            log_probs.append(log_prob)
+            sequences.append(tokens)
+            sum_log_probs += log_prob
+            total_tokens += sample_info['num_tokens']
+            
+            if sample_info['terminated_with_eos']:
+                eos_count += 1
+            
+            samples_done += 1
+            current_entropy = -sum_log_probs / samples_done
+            current_entropy_bits = current_entropy / torch.log(torch.tensor(2.0)).item()
+            entropy_history.append(current_entropy_bits)
+        
+        # Check early stopping condition (need at least 20 samples total)
         if samples_done >= 20:
-            # Calculate variance of entropy in second half
             half_point = (samples_done - 1) // 2 + 1
             second_half_entropy = entropy_history[half_point:]
             
@@ -157,17 +179,24 @@ def estimate_conditional_entropy(
                 
                 if entropy_variance < variance_threshold:
                     converged = True
+                    # Still display final stats even if converged
                     break
-
-        elapsed = time.time() - start_time
-        samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
-        samples_left = max_samples - samples_done
-        max_eta_sec = samples_left / samples_per_sec if samples_per_sec > 0 else 0
-
-        if samples_done % 10 == 0:
+        
+        # Display update
+        should_display = (display_interval > 0 and samples_done % display_interval == 0)
+        
+        if should_display:
+            elapsed = time.time() - start_time
+            samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
+            tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
+            samples_left = max_samples - samples_done
+            max_eta_sec = samples_left / samples_per_sec if samples_per_sec > 0 else 0
+            
+            # Clear previous display (plot + 2 stat lines)
             if last_plot_lines > 0:
-                clear_lines(last_plot_lines + 1)
-
+                clear_lines(last_plot_lines + 2)
+            
+            # Plot
             plt.clf()
             plt.plot(range(1, len(entropy_history) + 1), entropy_history)
             plt.title("QMC Entropy Convergence")
@@ -175,16 +204,17 @@ def estimate_conditional_entropy(
             plt.ylabel("Entropy (bits)")
             plt.plotsize(100, 20)
             plt.show()
-
+            
             last_plot_lines = 20
-
+            
+            # Stats lines
             elapsed_min = int(elapsed // 60)
             elapsed_sec = int(elapsed % 60)
             max_eta_min = int(max_eta_sec // 60)
             max_eta_sec_remainder = int(max_eta_sec % 60)
             eos_rate = eos_count / samples_done
             
-            # Show variance status
+            # Variance status
             if samples_done >= 20:
                 half_point = (samples_done - 1) // 2 + 1
                 second_half_entropy = entropy_history[half_point:]
@@ -196,20 +226,34 @@ def estimate_conditional_entropy(
             else:
                 var_status = f"Need {20 - samples_done} more"
             
+            # Line 1: Progress, entropy, EOS rate, variance
             print(
-                f"[{samples_done}/{max_samples}] "
+                f"[RUNNING] [{samples_done}/{max_samples}] "
                 f"H={current_entropy_bits:.3f}b | "
                 f"EOS: {eos_rate:.1%} | "
-                f"{samples_per_sec:.1f} samp/s | "
-                f"{elapsed_min}m{elapsed_sec:02d}s | "
-                f"MaxETA: {max_eta_min}m{max_eta_sec_remainder:02d}s | "
                 f"{var_status}"
             )
+            
+            # Line 2: Speed metrics and ETA
+            print(
+                f"| Speed: {samples_per_sec:.1f} samp/s, {tokens_per_sec:.1f} tok/s | "
+                f"Elapsed: {elapsed_min}m{elapsed_sec:02d}s | "
+                f"MaxETA: {max_eta_min}m{max_eta_sec_remainder:02d}s"
+            )
 
-    # Display final plot
-    if last_plot_lines > 0:
-        clear_lines(last_plot_lines + 1)
+    # Display final plot and stats
+    elapsed = time.time() - start_time
+    samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
+    tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
+    eos_rate = eos_count / samples_done
+    current_entropy = -sum_log_probs / samples_done
+    current_entropy_bits = current_entropy / torch.log(torch.tensor(2.0)).item()
     
+    # Clear previous display if it exists (only if display_interval > 0)
+    if display_interval > 0 and last_plot_lines > 0:
+        clear_lines(last_plot_lines + 2)
+    
+    # Final plot
     plt.clf()
     plt.plot(range(1, len(entropy_history) + 1), entropy_history)
     plt.title("QMC Entropy Convergence - FINAL")
@@ -218,30 +262,32 @@ def estimate_conditional_entropy(
     plt.plotsize(100, 20)
     plt.show()
     
-    # Print final status in same format as progress lines
-    elapsed = time.time() - start_time
+    # Final stats
     elapsed_min = int(elapsed // 60)
     elapsed_sec = int(elapsed % 60)
-    eos_rate = eos_count / samples_done
-    samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
     
-    half_point = (samples_done - 1) // 2 + 1
-    second_half_entropy = entropy_history[half_point:]
-    entropy_variance = np.var(second_half_entropy)
-    var_status = f"Var: {entropy_variance:.6f}"
-
-    if converged:
-        status = "CONVERGENCE"
+    if samples_done >= 20:
+        half_point = (samples_done - 1) // 2 + 1
+        second_half_entropy = entropy_history[half_point:]
+        entropy_variance = np.var(second_half_entropy)
+        var_status = f"Var: {entropy_variance:.6f}"
     else:
-        status = "NO CONVERGENCE"
+        var_status = "N/A (< 20 samples)"
     
+    status = "CONVERGED" if converged else "COMPLETED"
+    
+    # Line 1: Final status, progress, entropy, EOS rate, variance
     print(
         f"[{status}] [{samples_done}/{max_samples}] "
         f"H={current_entropy_bits:.3f}b | "
         f"EOS: {eos_rate:.1%} | "
-        f"{samples_per_sec:.1f} samp/s | "
-        f"Total: {elapsed_min}m{elapsed_sec:02d}s | "
         f"{var_status}"
+    )
+    
+    # Line 2: Speed metrics and total time
+    print(
+        f"| Speed: {samples_per_sec:.1f} samp/s, {tokens_per_sec:.1f} tok/s | "
+        f"Total: {elapsed_min}m{elapsed_sec:02d}s"
     )
 
     entropy = -sum(log_probs) / samples_done
@@ -270,10 +316,12 @@ def batch_estimate(
     device: str = "cuda",
     use_cache: bool = True,
     variance_threshold: float = 1e-4,
-    offset: float = 0.0
+    offset: float = 0.0,
+    batch_size: int = 128,
+    display_interval: int = 128,
 ) -> Dict[str, Tuple[float, Dict]]:
     """
-    Estimate entropy for multiple prefixes with early stopping.
+    Estimate entropy for multiple prefixes with early stopping and parallel batching.
     """
     results = {}
 
@@ -289,7 +337,9 @@ def batch_estimate(
             device=device,
             use_cache=use_cache,
             variance_threshold=variance_threshold,
-            offset=offset
+            offset=offset,
+            batch_size=batch_size,
+            display_interval=display_interval,
         )
         results[prefix] = (entropy, info)
         print(f"Entropy: {entropy:.4f} nats ({entropy/torch.log(torch.tensor(2.0)):.4f} bits)")
@@ -315,15 +365,17 @@ if __name__ == "__main__":
     # Test prefix
     prefix = "Please answer this question: what are some concept that is important for the gnu assembler (GAS)?"
     
-    print(f"\nTesting early stopping with variance threshold 1e-4...")
+    print(f"\nTesting parallel batching with batch_size=128...")
     
     entropy, info = estimate_conditional_entropy(
         model=model,
         tokenizer=tokenizer,
         prefix=prefix,
-        max_samples=1000,
+        max_samples=131072,
         max_len=128,
-        variance_threshold=1e-4
+        variance_threshold=5e-4,
+        batch_size=128,
+        display_interval=128
     )
     
     # Final summary

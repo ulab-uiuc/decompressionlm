@@ -25,12 +25,14 @@ def estimate_entropy(
     save_path: Optional[str] = None,
     model_name: Optional[str] = None,
     device: str = "cuda",
-    use_cache: bool = True,
+    use_cache: bool = True,  # Deprecated, always True in parallel mode
     variance_threshold: float = 1e-4,
-    offset: float = 0.0
+    offset: float = 0.0,
+    batch_size: int = 128,
+    display_interval: int = 128,
 ) -> Dict:
     """
-    Estimate H(X | prefix) using QMC sampling with early stopping.
+    Estimate H(X | prefix) using QMC sampling with early stopping and parallel batching.
     
     Args:
         model: Language model
@@ -42,9 +44,11 @@ def estimate_entropy(
         save_path: Optional path to save results as parquet
         model_name: Model name/identifier to save in metadata
         device: Device to run on
-        use_cache: Whether to use KV cache (highly recommended for speed)
+        use_cache: Deprecated (always True in parallel mode)
         variance_threshold: Stop when variance of entropy in second half < threshold
         offset: Cranley-Patterson rotation offset in [0, 1)
+        batch_size: Number of sequences to generate in parallel (default: 128)
+        display_interval: Update display every N samples (0 to disable, must be multiple of batch_size)
         
     Returns:
         Dict with entropy, log_probs, sequences, etc.
@@ -59,7 +63,9 @@ def estimate_entropy(
         device=device,
         use_cache=use_cache,
         variance_threshold=variance_threshold,
-        offset=offset
+        offset=offset,
+        batch_size=batch_size,
+        display_interval=display_interval,
     )
     
     # Convert to bits
@@ -145,57 +151,63 @@ if __name__ == "__main__":
     # print("Compiling model...")
     # model = torch.compile(model)
     
-    # # Example 1: Factual vs Reasoning
-    # print("\n" + "="*60)
-    # print("EXAMPLE 1: Factual < Reasoning Entropy")
-    # print("="*60)
-    
-    # factual = estimate_entropy(
-    #     model=model,
-    #     tokenizer=tokenizer,
-    #     prefix="What is the capital of France?",
-    #     max_samples=500,
-    #     max_len=32,
-    #     model_name=model_name,
-    #     variance_threshold=1e-2,
-    #     offset=0.0
-    # )
-    
-    # reasoning = estimate_entropy(
-    #     model=model,
-    #     tokenizer=tokenizer,
-    #     prefix="What are common ways to solve a coding challenge?",
-    #     max_samples=1000,
-    #     max_len=32,
-    #     model_name=model_name,
-    #     variance_threshold=1e-2,
-    #     offset=0.0
-    # )
-    
-    # print(f"\nFactual entropy:   {factual['entropy_bits']:.2f} bits (EOS rate: {factual['eos_rate']:.1%}, samples: {factual['n_samples']})")
-    # print(f"Reasoning entropy: {reasoning['entropy_bits']:.2f} bits (EOS rate: {reasoning['eos_rate']:.1%}, samples: {reasoning['n_samples']})")
-    # print(f"Difference:        {reasoning['entropy_bits'] - factual['entropy_bits']:.2f} bits")
-    
-    # if reasoning['entropy_bits'] > factual['entropy_bits']:
-    #     print("\n✓ HYPOTHESIS CONFIRMED: Reasoning has higher entropy than factual!")
-    # else:
-    #     print("\n✗ HYPOTHESIS REJECTED")
-    
-    # Example 2: Technical Question Entropy
+    # Example 1: Factual vs Reasoning
     print("\n" + "="*60)
-    print("EXAMPLE 2: Technical Question Entropy")
+    print("EXAMPLE 1: Factual < Reasoning Entropy")
+    print("="*60)
+    
+    factual = estimate_entropy(
+        model=model,
+        tokenizer=tokenizer,
+        prefix="What is the capital of France?",
+        max_samples=131072,
+        max_len=32,
+        model_name=model_name,
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,  # Smaller batch for short sequences
+        display_interval=128,  # Update every 2 batches
+    )
+    
+    reasoning = estimate_entropy(
+        model=model,
+        tokenizer=tokenizer,
+        prefix="What are common ways to solve a coding challenge?",
+        max_samples=131072,
+        max_len=32,
+        model_name=model_name,
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,
+        display_interval=128,
+    )
+    
+    print(f"\nFactual entropy:   {factual['entropy_bits']:.2f} bits (EOS rate: {factual['eos_rate']:.1%}, samples: {factual['n_samples']})")
+    print(f"Reasoning entropy: {reasoning['entropy_bits']:.2f} bits (EOS rate: {reasoning['eos_rate']:.1%}, samples: {reasoning['n_samples']})")
+    print(f"Difference:        {reasoning['entropy_bits'] - factual['entropy_bits']:.2f} bits")
+    
+    if reasoning['entropy_bits'] > factual['entropy_bits']:
+        print("\n✓ HYPOTHESIS CONFIRMED: Reasoning has higher entropy than factual!")
+    else:
+        print("\n✗ HYPOTHESIS REJECTED")
+    
+    # Example 2: Technical Question Entropy with parallel batching
+    print("\n" + "="*60)
+    print("EXAMPLE: Technical Question Entropy (Parallel)")
     print("="*60)
     
     technical = estimate_entropy(
         model=model,
         tokenizer=tokenizer,
         prefix="What are some concepts that are important for the GNU assembler (GAS)?",
-        max_samples=1000,
+        max_samples=131072,
         max_len=1024,
-        save_path="results/gas_question.parquet",
+        save_path="results/gnu_assembly_question.parquet",
         model_name=model_name,
-        variance_threshold=1e-2,
-        offset=0.0
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,
+        display_interval=256,  # Update every 2 batches
     )
 
     print()
@@ -204,31 +216,35 @@ if __name__ == "__main__":
     print(f"Samples used              : {technical['n_samples']}")
     print(f"Converged?                : {technical['converged']}")
     
-    # Example 3: Compare question specificity
+    # Example 3: Compare question specificity with parallel batching
     print("\n" + "="*60)
-    print("EXAMPLE 3: Question Specificity Comparison")
+    print("EXAMPLE: Question Specificity Comparison (Parallel)")
     print("="*60)
     
     vague = estimate_entropy(
         model=model,
         tokenizer=tokenizer,
         prefix="What is programming?",
-        max_samples=500,
-        max_len=50,
+        max_samples=131072,
+        max_len=64,
         model_name=model_name,
-        variance_threshold=1e-2,
-        offset=0.0
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,
+        display_interval=128,
     )
     
     specific = estimate_entropy(
         model=model,
         tokenizer=tokenizer,
         prefix="What is the time complexity of quicksort?",
-        max_samples=500,
+        max_samples=131072,
         max_len=64,
         model_name=model_name,
-        variance_threshold=1e-2,
-        offset=0.0
+        variance_threshold=5e-4,
+        offset=0.0,
+        batch_size=128,
+        display_interval=128,
     )
     
     print(f"\nVague question entropy:    {vague['entropy_bits']:.2f} bits (EOS: {vague['eos_rate']:.1%}, samples: {vague['n_samples']})")
