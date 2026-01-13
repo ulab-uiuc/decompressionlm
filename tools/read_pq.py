@@ -1,22 +1,30 @@
 """
-Read and analyze DecompressionLM results from parquet files.
+Read and analyze DecompressionLM bin entropy results from parquet files.
 
-Expected schema (strict, no legacy support):
+Expected schema:
 - code: float64
-- log_prob: float64
-- sequence_length: int32
 - sequence: list<uint32>   (token IDs)
-Parquet file metadata should include: model_name, prefix, entropy_bits, etc.
+- sequence_length: int32
+
+Metadata includes:
+- bin_prefix_lens: List of tracked bin lengths
+- For each bin length N:
+  - lenN_converged: Whether it converged
+  - lenN_convergence_sample: Sample number where it converged
+  - lenN_final_entropy_bits: Final entropy in bits
+  - lenN_n_unique_bins: Number of unique bins observed
 """
 
 import sys
 import pyarrow.parquet as pq
 import numpy as np
+from collections import defaultdict
+from typing import Dict, List, Tuple
 from transformers import AutoTokenizer
 
 
 def load_results(path: str):
-    """Load results from parquet file (strict schema)."""
+    """Load bin entropy results from parquet file."""
     table = pq.read_table(path)
 
     # Extract metadata (bytes -> str)
@@ -34,7 +42,7 @@ def load_results(path: str):
         raise TypeError(
             f"Expected 'sequence' to be a list column (list<uint32>). "
             f"Got element type: {type(sequences[0])}. "
-            f"Old string-based format is not supported; regenerate results."
+            f"Old format is not supported; regenerate results."
         )
 
     # Strict: token IDs must be non-negative
@@ -44,87 +52,182 @@ def load_results(path: str):
 
     return {
         "codes": data["code"],
-        "log_probs": data["log_prob"],
-        "sequence_lengths": data["sequence_length"],
         "sequences": sequences,  # list[list[int]]
+        "sequence_lengths": data["sequence_length"],
         "metadata": metadata,
     }
 
 
-def analyze_results(results, decode_sequences: bool = True, show_k: int = 5, max_chars: int = 500):
-    """Print analysis of results. Prints both token IDs and decoded text."""
+def extract_bin_prefix(tokens: List[int], bin_len: int, eos_token_id: int) -> tuple:
+    """
+    Extract bin prefix of specified length, padding with EOS if needed.
+    (Same logic as in bin_entropy.py)
+    """
+    if len(tokens) >= bin_len:
+        return tuple(tokens[:bin_len])
+    else:
+        # Pad with EOS tokens
+        return tuple(tokens + [eos_token_id] * (bin_len - len(tokens)))
+
+
+def compute_bin_statistics(
+    sequences: List[List[int]], 
+    bin_len: int, 
+    eos_token_id: int
+) -> Dict:
+    """Compute statistics for a specific bin length."""
+    bin_counts = defaultdict(int)
+    bin_to_sequences = defaultdict(list)  # Track which sequences belong to each bin
+    
+    for seq_idx, seq in enumerate(sequences):
+        bin_tuple = extract_bin_prefix(seq, bin_len, eos_token_id)
+        bin_counts[bin_tuple] += 1
+        bin_to_sequences[bin_tuple].append(seq_idx)
+    
+    # Compute empirical entropy
+    total = len(sequences)
+    entropy = 0.0
+    for count in bin_counts.values():
+        if count > 0:
+            p = count / total
+            entropy -= p * np.log2(p)
+    
+    # Get top bins by frequency
+    sorted_bins = sorted(bin_counts.items(), key=lambda x: x[1], reverse=True)
+    
+    return {
+        'n_unique': len(bin_counts),
+        'entropy_bits': entropy,
+        'total_samples': total,
+        'bin_counts': dict(bin_counts),
+        'bin_to_sequences': dict(bin_to_sequences),
+        'top_bins': sorted_bins[:10],  # Top 10 most frequent
+    }
+
+
+def analyze_results(
+    results, 
+    decode_sequences: bool = True, 
+    show_sample_bins: int = 5,
+    examples_per_bin: int = 3,
+    max_chars_per_example: int = 150
+):
+    """Print comprehensive analysis of bin entropy results."""
     meta = results["metadata"]
 
-    print("=" * 60)
-    print("RESULTS SUMMARY")
-    print("=" * 60)
+    print("=" * 80)
+    print("BIN ENTROPY RESULTS SUMMARY")
+    print("=" * 80)
     print(f"Model: {meta.get('model_name', 'N/A')}")
     print(f"Prefix: {meta.get('prefix', 'N/A')}")
-    print(f"Samples: {meta.get('n_samples', 'N/A')}")
-    print(f"Entropy: {meta.get('entropy', 'N/A')} nats")
-    print(f"Entropy: {meta.get('entropy_bits', 'N/A')} bits")
-    print(f"EOS rate: {meta.get('eos_rate', 'N/A')}")
-    print(f"Converged: {meta.get('converged', 'N/A')}")
-    print(f"Offset: {meta.get('offset', '0.0')}")
+    print(f"Total samples: {meta.get('samples', 'N/A')}")
+    print(f"All converged: {meta.get('all_converged', 'N/A')}")
+    print(f"Variance threshold: {meta.get('variance_threshold', 'N/A')}")
+    print(f"Elapsed time: {meta.get('elapsed_time', 'N/A')} seconds")
 
-    print("\n" + "=" * 60)
+    # Parse bin_prefix_lens from metadata
+    bin_prefix_lens_str = meta.get('bin_prefix_lens', '[]')
+    bin_prefix_lens = eval(bin_prefix_lens_str)  # Safe since we control the format
+    
+    print(f"\nTracked bin lengths: {bin_prefix_lens}")
+
+    # Print convergence info for each bin length
+    print("\n" + "=" * 80)
+    print("CONVERGENCE STATUS PER BIN LENGTH")
+    print("=" * 80)
+    
+    for bin_len in bin_prefix_lens:
+        converged = meta.get(f'len{bin_len}_converged', 'N/A')
+        conv_sample = meta.get(f'len{bin_len}_convergence_sample', 'N/A')
+        final_entropy = meta.get(f'len{bin_len}_final_entropy_bits', 'N/A')
+        n_unique = meta.get(f'len{bin_len}_n_unique_bins', 'N/A')
+        
+        status = "✓" if converged == "True" else "✗"
+        print(f"Bin length {bin_len:2d}: {status} converged at sample {conv_sample}")
+        print(f"  Final entropy: {final_entropy} bits")
+        print(f"  Unique bins: {n_unique}")
+        print()
+
+    # Sequence statistics
+    print("=" * 80)
     print("SEQUENCE STATISTICS")
-    print("=" * 60)
+    print("=" * 80)
 
     lengths = results["sequence_lengths"]
-    log_probs = results["log_probs"]
-
     print(f"Avg length: {np.mean(lengths):.1f} tokens")
     print(f"Min length: {min(lengths)} tokens")
     print(f"Max length: {max(lengths)} tokens")
     print(f"Std length: {np.std(lengths):.1f} tokens")
 
-    print(f"\nAvg log prob: {np.mean(log_probs):.2f}")
-    print(f"Min log prob: {min(log_probs):.2f}")
-    print(f"Max log prob: {max(log_probs):.2f}")
-
-    # Per-token entropy (approx): H / E[length]
-    try:
-        entropy_bits = float(meta.get("entropy_bits", 0.0))
-        avg_len = float(np.mean(lengths))
-        if avg_len > 0:
-            print(f"\nPer-token entropy (H/E[L]): {entropy_bits / avg_len:.2f} bits/token")
-    except Exception:
-        pass
-
-    # Tokenizer for decoding
+    # Load tokenizer if needed
     tokenizer = None
+    eos_token_id = None
     if decode_sequences:
         model_name = meta.get("model_name", None)
         if not model_name:
-            raise ValueError("decode_sequences=True but parquet metadata missing 'model_name'")
-        print("\nLoading tokenizer for {0}...".format(model_name))
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+            print("\nWarning: decode_sequences=True but parquet metadata missing 'model_name'")
+            print("Skipping decoding...")
+        else:
+            print(f"\nLoading tokenizer for {model_name}...")
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            eos_token_id = tokenizer.eos_token_id
 
-    print("\n" + "=" * 60)
-    print(f"SAMPLE SEQUENCES (first {min(show_k, len(results['sequences']))})")
-    print("=" * 60)
-
+    # Analyze bins for each length
     sequences = results["sequences"]
+    
+    if eos_token_id is None:
+        print("\nWarning: Cannot compute bin statistics without EOS token ID")
+        print("Skipping bin analysis...")
+        return
 
-    for i in range(min(show_k, len(sequences))):
-        token_ids = [int(t) for t in sequences[i]]  # ensure plain ints
-        if any(t < 0 for t in token_ids):
-            raise ValueError(f"Negative token id found in sample {i}: {token_ids[:20]}")
-
-        print(f"\nSample {i+1} (len={lengths[i]}, logp={log_probs[i]:.2f}):")
-        print(f"Token IDs: {token_ids[:80]}{' ...' if len(token_ids) > 80 else ''}")
-
-        if tokenizer is not None:
-            text = tokenizer.decode(token_ids, skip_special_tokens=True)
-            if len(text) > max_chars:
-                text = text[:max_chars] + "..."
-            print("Decoded:")
-            print(text)
+    for bin_len in bin_prefix_lens:
+        print("\n" + "=" * 80)
+        print(f"BIN ANALYSIS: LENGTH {bin_len}")
+        print("=" * 80)
+        
+        bin_stats = compute_bin_statistics(sequences, bin_len, eos_token_id)
+        
+        print(f"Unique bins: {bin_stats['n_unique']}")
+        print(f"Empirical entropy: {bin_stats['entropy_bits']:.4f} bits")
+        print(f"Total samples: {bin_stats['total_samples']}")
+        
+        # Show top bins with example sequences
+        print(f"\nTop {min(show_sample_bins, len(bin_stats['top_bins']))} most frequent bins:")
+        print("-" * 80)
+        
+        for i, (bin_tuple, count) in enumerate(bin_stats['top_bins'][:show_sample_bins]):
+            prob = count / bin_stats['total_samples']
+            print(f"\nBin #{i+1} (count={count}, prob={prob:.4f}):")
+            
+            # Decode the bin itself
+            if tokenizer is not None:
+                bin_text = tokenizer.decode(list(bin_tuple), skip_special_tokens=False)
+                print(f"  Bin: {repr(bin_text)}")
+            
+            # Show example sequences from this bin
+            seq_indices = bin_stats['bin_to_sequences'][bin_tuple]
+            n_examples = min(examples_per_bin, len(seq_indices))
+            print(f"\n  Example sequences from this bin ({n_examples}/{len(seq_indices)} shown):")
+            
+            for j, seq_idx in enumerate(seq_indices[:n_examples]):
+                full_seq = sequences[seq_idx]
+                
+                if tokenizer is not None:
+                    full_text = tokenizer.decode(full_seq, skip_special_tokens=True)
+                    if len(full_text) > max_chars_per_example:
+                        full_text = full_text[:max_chars_per_example] + "..."
+                    print(f"    {j+1}. {repr(full_text)}")
+                else:
+                    print(f"    {j+1}. [tokens: {full_seq[:20]}{'...' if len(full_seq) > 20 else ''}]")
 
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "results/gas_question.parquet"
+    if len(sys.argv) < 2:
+        print("Usage: python -m src.read_results <path_to_parquet>")
+        print("Example: python -m src.read_results results/factual_question.delm.parquet")
+        sys.exit(1)
+    
+    path = sys.argv[1]
     print(f"Loading results from {path}...")
     results = load_results(path)
-    analyze_results(results, decode_sequences=True)
+    analyze_results(results, decode_sequences=True, show_sample_bins=5, examples_per_bin=3)
