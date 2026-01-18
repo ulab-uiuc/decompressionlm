@@ -1,28 +1,38 @@
+#!/usr/bin/env python3
 """
-Example script demonstrating bin entropy estimation.
+Example script for prefix mass-based sampling.
 
-This shows how to use the bin entropy API to detect memorization vs. learning
-by measuring the empirical entropy of token prefix distributions.
+This demonstrates the new algorithm:
+1. Sample sequences until cumulative prefix probability mass > threshold
+2. Cluster sequences by similarity to get effective support set
+3. Report statistics about the support set
 """
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.bin_entropy import estimate_bin_entropy
+from src.bin_entropy import estimate_prefix_mass
 
 
 def main():
-    print("="*80)
-    print("BIN ENTROPY ESTIMATION EXAMPLE")
-    print("="*80)
-    print("\nThis example demonstrates how bin entropy can reveal memorization.")
-    print("- Low entropy at short bin lengths → model memorized common patterns")
-    print("- High entropy → model is generating diverse, creative responses")
-    print()
-    
-    # Load model
+    # Configuration
     model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    print(f"Loading model: {model_name}...")
     
+    # Test prompts
+    prompts = [
+        "How does LEDs work?",
+        "What are the differences between Minecraft Java and Bedrock editions?",
+        # "",  # Unconditional (BOS-only)
+    ]
+    
+    # Sampling parameters
+    max_len = 256 # Max seqence length
+    prefix_len = 32  # Track first 4 tokens as prefix pattern
+    prob_threshold = 0.1  # Stop when 90% of prefix mass is discovered
+    similarity_threshold = 0.85  # More than 85% similarity will be considered deduplication
+    max_samples = 262144
+    
+    # Load model once
+    print(f"Loading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -30,96 +40,41 @@ def main():
         device_map="auto"
     )
     
-    print("Model loaded!\n")
-    
-    # Example 1: Factual question (expect low entropy - memorized answer)
-    print("\n" + "="*80)
-    print("EXAMPLE 1: Factual Question (Expected: LOW entropy)")
-    print("="*80)
-    print("Question: 'What is the capital of France?'")
-    print("Hypothesis: Model has memorized this fact, should have low bin entropy\n")
-    
-    factual_results = estimate_bin_entropy(
-        model=model,
-        tokenizer=tokenizer,
-        prefix="What is the capital of France?",
-        bin_prefix_lens=[1, 2, 4, 8, 16],
-        max_samples=262144,
-        max_len=32,
-        batch_size=128,
-        display_interval=256,
-        variance_threshold=1e-2,
-        save_path="results/factual_question.delm.parquet",
-        model_name=model_name,
-    )
-    
-    # Example 2: Open-ended question (expect higher entropy - diverse answers)
-    print("\n" + "="*80)
-    print("EXAMPLE 2: Open-ended Question (Expected: HIGHER entropy)")
-    print("="*80)
-    print("Question: 'What are some interesting facts about space?'")
-    print("Hypothesis: Many valid answers, should have higher bin entropy\n")
-    
-    creative_results = estimate_bin_entropy(
-        model=model,
-        tokenizer=tokenizer,
-        prefix="What are some interesting facts about space?",
-        bin_prefix_lens=[1, 2, 4, 8, 16, 32],
-        max_samples=262144,
-        max_len=64,
-        batch_size=128,
-        display_interval=256,
-        variance_threshold=1e-2,
-        save_path="results/creative_question.delm.parquet",
-        model_name=model_name,
-    )
-    
-    # Compare results
-    print("\n" + "="*80)
-    print("COMPARISON")
-    print("="*80)
-    
-    print("\nFactual Question Entropies:")
-    for bin_len in factual_results['bin_prefix_lens']:
-        h = factual_results['bin_data'][bin_len]['entropy_history'][-1]
-        print(f"  Bin length {bin_len}: {h:.3f} bits")
-    
-    print("\nOpen-ended Question Entropies:")
-    for bin_len in creative_results['bin_prefix_lens']:
-        h = creative_results['bin_data'][bin_len]['entropy_history'][-1]
-        print(f"  Bin length {bin_len}: {h:.3f} bits")
-    
-    print("\nEntropy Differences (Open-ended - Factual):")
-    for bin_len in factual_results['bin_prefix_lens']:
-        h_fact = factual_results['bin_data'][bin_len]['entropy_history'][-1]
-        h_open = creative_results['bin_data'][bin_len]['entropy_history'][-1]
-        diff = h_open - h_fact
-        print(f"  Bin length {bin_len}: {diff:+.3f} bits")
-    
-    # Check hypothesis
-    print("\n" + "="*80)
-    print("HYPOTHESIS CHECK")
-    print("="*80)
-    
-    # Compare at bin length 2 (good discriminator)
-    h_fact_2 = factual_results['bin_data'][2]['entropy_history'][-1]
-    h_open_2 = creative_results['bin_data'][2]['entropy_history'][-1]
-    
-    if h_open_2 > h_fact_2:
-        print("✓ HYPOTHESIS CONFIRMED!")
-        print(f"  Open-ended question has {h_open_2 - h_fact_2:.3f} bits MORE entropy at bin length 2")
-        print("  This suggests the model generates more diverse responses for open-ended questions.")
-    else:
-        print("✗ HYPOTHESIS REJECTED")
-        print("  Unexpected result - factual question has equal or higher entropy")
-    
-    print("\n" + "="*80)
-    print("EXAMPLE COMPLETE")
-    print("="*80)
-    print("\nKey Takeaway:")
-    print("Bin entropy reveals what the model has memorized (low entropy)")
-    print("vs. what it generates creatively (high entropy).")
-    print("\nResults saved to results/ directory as .delm.parquet files.")
+    # Run for each prompt
+    for i, prompt in enumerate(prompts):
+        print(f"\n{'='*80}")
+        print(f"PROMPT {i+1}/{len(prompts)}")
+        print(f"{'='*80}")
+        
+        if prompt == "":
+            save_name = "unconditional"
+            use_chat = False
+        else:
+            save_name = prompt[:30].replace(" ", "_").replace("?", "")
+            use_chat = True
+        
+        results = estimate_prefix_mass(
+            model=model,
+            tokenizer=tokenizer,
+            prefix=prompt,
+            prefix_len=prefix_len,
+            prob_threshold=prob_threshold,
+            similarity_threshold=similarity_threshold,
+            max_samples=max_samples,  # Hard limit
+            max_len=max_len,
+            use_chat_template=use_chat,
+            batch_size=128,
+            display_interval=256,
+            save_path=f"results/{save_name}.delm.parquet",
+            model_name=model_name,
+        )
+        
+        print(f"\nSummary for '{prompt[:50]}...':")
+        print(f"  Discovered {results['unique_prefixes']} unique prefix patterns")
+        print(f"  Sampled {results['samples_done']} total sequences")
+        print(f"  Effective support: {results['effective_set_size']} sequences")
+        print(f"  Avg tokens/seq: {results['effective_set_stats']['avg_tokens']:.1f}")
+        print(f"  Total tokens: {results['effective_set_stats']['total_tokens']}")
 
 
 if __name__ == "__main__":
