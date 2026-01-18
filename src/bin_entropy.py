@@ -1,9 +1,8 @@
 """
-Bin-based entropy estimation for detecting memorization vs. learning.
+Prefix mass-based sampling for estimating effective support size.
 
-Instead of measuring H(X|prefix) = -E[log P(X)], we measure the empirical
-entropy of bin distributions where bins are defined by the first N tokens
-of generation.
+Sample sequences until cumulative probability mass of discovered prefix patterns
+exceeds a threshold, then compute effective support set after deduplication.
 """
 
 import time
@@ -11,12 +10,13 @@ import torch
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 from pathlib import Path
 from collections import defaultdict
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import plotext as plt
 import transformers
+import Levenshtein  # pip install python-Levenshtein
 
 from src.vdc import generate_vdc_sequence
 from src.arithmetic import parallel_arithmetic_sample_batch
@@ -29,132 +29,199 @@ def clear_lines(n):
         print('\033[F\033[K', end='')
 
 
-def extract_bin_prefix(tokens: List[int], bin_len: int, eos_token_id: int) -> tuple:
+def extract_prefix(tokens: List[int], prefix_len: int, eos_token_id: int) -> tuple:
     """
-    Extract bin prefix of specified length, padding with EOS if needed.
+    Extract prefix of specified length, padding with EOS if needed.
     
     Args:
         tokens: Generated token IDs (excluding EOS at end if terminated)
-        bin_len: Length of bin prefix
+        prefix_len: Length of prefix
         eos_token_id: EOS token ID for padding
         
     Returns:
-        Tuple of exactly bin_len token IDs
-        
-    Examples:
-        >>> extract_bin_prefix([123, 456], 4, 999)
-        (123, 456, 999, 999)
-        >>> extract_bin_prefix([1, 2, 3, 4, 5], 3, 999)
-        (1, 2, 3)
+        Tuple of exactly prefix_len token IDs
     """
-    if len(tokens) >= bin_len:
-        return tuple(tokens[:bin_len])
+    if len(tokens) >= prefix_len:
+        return tuple(tokens[:prefix_len])
     else:
         # Pad with EOS tokens
-        return tuple(tokens + [eos_token_id] * (bin_len - len(tokens)))
+        return tuple(tokens + [eos_token_id] * (prefix_len - len(tokens)))
 
 
-class IncrementalEntropyTracker:
+def compute_prefix_probabilities(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompt_ids: torch.Tensor,
+    prefix_patterns: Set[tuple],
+    device: str = "cuda",
+) -> Dict[tuple, float]:
     """
-    Track empirical entropy incrementally in O(1) per update.
+    Compute exact probabilities for a set of prefix patterns.
     
-    Uses the identity:
-    H = log2(N) - (1/N) * Σ c_i * log2(c_i)
-    
-    Maintains S = Σ c_i * log2(c_i) and updates only affected bin.
-    """
-    
-    def __init__(self):
-        self.N = 0  # Total samples
-        self.S = 0.0  # Σ c_i * log2(c_i)
-        self.counts = defaultdict(int)
-        self.entropy_history = []
-    
-    def update(self, bin_tuple: tuple) -> float:
-        """
-        Update with a new sample and return current entropy.
+    Args:
+        model: Language model
+        tokenizer: Tokenizer
+        prompt_ids: Prompt token IDs [1, seq_len]
+        prefix_patterns: Set of prefix tuples to compute probs for
+        device: Device to run on
         
-        Args:
-            bin_tuple: The bin for this sample
+    Returns:
+        Dict mapping prefix tuple -> probability
+    """
+    if not prefix_patterns:
+        return {}
+    
+    model.eval()
+    prefix_probs = {}
+    
+    with torch.no_grad():
+        # Group prefixes by length for efficiency
+        by_length = defaultdict(list)
+        for pattern in prefix_patterns:
+            by_length[len(pattern)].append(pattern)
+        
+        for length, patterns in by_length.items():
+            # Start with prompt
+            input_ids = prompt_ids.to(device)
+            cumulative_log_prob = 0.0
             
-        Returns:
-            Current entropy in bits
-        """
-        old_count = self.counts[bin_tuple]
-        new_count = old_count + 1
-        
-        # Update S by removing old contribution and adding new
-        if old_count > 0:
-            self.S -= old_count * np.log2(old_count)
-        self.S += new_count * np.log2(new_count)
-        
-        # Update count and total
-        self.counts[bin_tuple] = new_count
-        self.N += 1
-        
-        # Compute entropy: H = log2(N) - S/N
-        if self.N > 0:
-            entropy = np.log2(self.N) - self.S / self.N
-        else:
-            entropy = 0.0
-        
-        self.entropy_history.append(entropy)
-        return entropy
+            # For each position in the prefix
+            for pos in range(length):
+                outputs = model(input_ids)
+                logits = outputs.logits[:, -1, :]  # [1, vocab_size]
+                log_probs = torch.log_softmax(logits, dim=-1)
+                
+                # Compute probability for each pattern's token at this position
+                for pattern in patterns:
+                    token_id = pattern[pos]
+                    if pos == 0:
+                        prefix_probs[pattern] = log_probs[0, token_id].item()
+                    else:
+                        prefix_probs[pattern] += log_probs[0, token_id].item()
+                
+                # For next iteration, we need to continue with one token
+                # (doesn't matter which for independent computations)
+                if pos < length - 1:
+                    next_token = torch.tensor([[patterns[0][pos]]], device=device)
+                    input_ids = torch.cat([input_ids, next_token], dim=1)
+    
+    # Convert log probs to probs
+    for pattern in prefix_probs:
+        prefix_probs[pattern] = np.exp(prefix_probs[pattern])
+    
+    return prefix_probs
 
 
-def save_bin_results(
-    results: Dict,
+def tokens_to_string(tokens: List[int], tokenizer: AutoTokenizer) -> str:
+    """Convert token IDs to string for comparison."""
+    return tokenizer.decode(tokens, skip_special_tokens=True)
+
+
+def compute_sequence_similarity(seq1: List[int], seq2: List[int], tokenizer: AutoTokenizer) -> float:
+    """
+    Compute similarity between two sequences using normalized edit distance.
+    
+    Returns:
+        Similarity score in [0, 1] where 1 is identical
+    """
+    # Convert to strings for comparison
+    str1 = tokens_to_string(seq1, tokenizer)
+    str2 = tokens_to_string(seq2, tokenizer)
+    
+    # Levenshtein distance
+    dist = Levenshtein.distance(str1, str2)
+    max_len = max(len(str1), len(str2))
+    
+    if max_len == 0:
+        return 1.0
+    
+    # Normalize to [0, 1] similarity
+    similarity = 1.0 - (dist / max_len)
+    return similarity
+
+
+def cluster_sequences(
+    sequences: List[List[int]],
+    tokenizer: AutoTokenizer,
+    similarity_threshold: float = 0.85,
+) -> List[int]:
+    """
+    Cluster similar sequences and return representative indices.
+    
+    Uses greedy clustering: iterate through sequences, add to cluster if
+    sufficiently similar to any existing representative, otherwise start new cluster.
+    
+    Args:
+        sequences: List of token ID sequences
+        tokenizer: Tokenizer for decoding
+        similarity_threshold: Minimum similarity to be considered duplicate
+        
+    Returns:
+        List of indices into sequences representing unique clusters
+    """
+    if not sequences:
+        return []
+    
+    representatives = [0]  # Start with first sequence
+    
+    for i in range(1, len(sequences)):
+        is_duplicate = False
+        
+        # Check against all representatives
+        for rep_idx in representatives:
+            sim = compute_sequence_similarity(sequences[i], sequences[rep_idx], tokenizer)
+            if sim >= similarity_threshold:
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            representatives.append(i)
+    
+    return representatives
+
+
+def save_mass_results(
     sequences: List[List[int]],
     codes: List[float],
     terminated: List[bool],
+    prefix_probs: Dict[tuple, float],
+    discovered_prefixes: List[tuple],
+    mass_history: List[float],
+    effective_set_indices: List[int],
     save_path: str,
     model_name: Optional[str] = None,
     tokenizer_name: Optional[str] = None,
     actual_prompt: Optional[str] = None,
+    prefix_len: Optional[int] = None,
+    prob_threshold: Optional[float] = None,
+    similarity_threshold: Optional[float] = None,
     max_len: Optional[int] = None,
     batch_size: Optional[int] = None,
-    display_interval: Optional[int] = None,
-    use_chat_template: Optional[bool] = None,
     offset: Optional[float] = None,
-    torch_dtype: Optional[str] = None,
-    device_map: Optional[str] = None,
+    total_mass: Optional[float] = None,
+    n_unique_prefixes: Optional[int] = None,
+    elapsed_time: Optional[float] = None,
 ):
     """
-    Save bin entropy results to a single .delm.parquet file.
+    Save mass-based sampling results to .delm.parquet file.
     
-    Saves raw sequences in sampling order so any bin length can be reconstructed.
-    Also saves metadata about convergence for each bin length tracked.
-    
-    Args:
-        results: Results dict from estimate_bin_entropy()
-        sequences: List of raw token sequences in sampling order
-        codes: List of VdC codes used for sampling
-        terminated: List of whether each sequence hit EOS
-        save_path: Path to save file (should end in .delm.parquet)
-        model_name: Model name/identifier
-        tokenizer_name: Tokenizer name (may differ from model)
-        actual_prompt: The actual prompt after chat template
-        max_len: Maximum generation length
-        batch_size: Batch size used
-        display_interval: Display interval used
-        use_chat_template: Whether chat template was used
-        offset: VdC offset used
-        torch_dtype: Torch dtype string (e.g., "torch.float16")
-        device_map: Device map string (e.g., "auto")
+    Saves all sequences with a flag indicating if they're in the effective support set.
     """
-    # Parse the path
     path = Path(save_path)
     
-    # Check if it ends with .delm.parquet
     if not save_path.endswith('.delm.parquet'):
-        # Auto-add the extension if missing
         save_path = save_path + '.delm.parquet'
         path = Path(save_path)
         print(f"Note: Auto-adding .delm.parquet extension")
     
     path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Convert sequences to Arrow list<uint32>
+    # Create effective set flags
+    effective_set_flags = [False] * len(sequences)
+    for idx in effective_set_indices:
+        effective_set_flags[idx] = True
+    
+    # Convert sequences to Arrow
     sequence_array = pa.array(sequences, type=pa.list_(pa.uint32()))
     
     # Create data table
@@ -163,80 +230,76 @@ def save_bin_results(
         'sequence': sequence_array,
         'sequence_length': pa.array([len(seq) for seq in sequences], type=pa.int32()),
         'terminated': pa.array(terminated, type=pa.bool_()),
+        'in_effective_set': pa.array(effective_set_flags, type=pa.bool_()),
     }
     
-    # Build convergence info for metadata
-    convergence_info = {}
-    final_entropies = {}
-    for bin_len in results['bin_prefix_lens']:
-        bin_data = results['bin_data'][bin_len]
-        convergence_info[f'len{bin_len}_converged'] = str(bin_data['converged'])
-        convergence_info[f'len{bin_len}_convergence_sample'] = str(bin_data['convergence_sample'] or 'N/A')
-        final_entropy = bin_data['entropy_history'][-1] if bin_data['entropy_history'] else 0.0
-        final_entropies[f'len{bin_len}_final_entropy_bits'] = str(final_entropy)
-        convergence_info[f'len{bin_len}_n_unique_bins'] = str(len(bin_data['counts']))
-    
-    # Metadata - core info
+    # Metadata
     metadata = {
-        'prefix': results['prefix'],
-        'bin_prefix_lens': str(results['bin_prefix_lens']),
-        'samples': str(results['samples_done']),
-        'all_converged': str(results['all_converged']),
-        'variance_threshold': str(results['variance_threshold']),
-        'elapsed_time': str(results['elapsed_time']),
+        'sampling_mode': 'prefix_mass',
+        'total_sequences': str(len(sequences)),
+        'effective_set_size': str(len(effective_set_indices)),
     }
+    
+    if prefix_len is not None:
+        metadata['prefix_len'] = str(prefix_len)
+    if prob_threshold is not None:
+        metadata['prob_threshold'] = str(prob_threshold)
+    if similarity_threshold is not None:
+        metadata['similarity_threshold'] = str(similarity_threshold)
+    if total_mass is not None:
+        metadata['final_prefix_mass'] = str(total_mass)
+    if n_unique_prefixes is not None:
+        metadata['unique_prefixes_discovered'] = str(n_unique_prefixes)
+    if elapsed_time is not None:
+        metadata['elapsed_time'] = str(elapsed_time)
     
     # Sampling parameters
     if max_len is not None:
         metadata['max_len'] = str(max_len)
     if batch_size is not None:
         metadata['batch_size'] = str(batch_size)
-    if display_interval is not None:
-        metadata['display_interval'] = str(display_interval)
-    if use_chat_template is not None:
-        metadata['use_chat_template'] = str(use_chat_template)
     if offset is not None:
         metadata['offset'] = str(offset)
     
-    # Model/tokenizer info
+    # Model info
     if model_name:
         metadata['model_name'] = model_name
     if tokenizer_name:
         metadata['tokenizer_name'] = tokenizer_name
     if actual_prompt:
         metadata['actual_prompt'] = actual_prompt
-    if torch_dtype:
-        metadata['torch_dtype'] = torch_dtype
-    if device_map:
-        metadata['device_map'] = device_map
     
-    # Environment info
+    # Effective set statistics
+    if effective_set_indices:
+        eff_sequences = [sequences[i] for i in effective_set_indices]
+        eff_lengths = [len(seq) for seq in eff_sequences]
+        metadata['effective_set_min_tokens'] = str(min(eff_lengths))
+        metadata['effective_set_max_tokens'] = str(max(eff_lengths))
+        metadata['effective_set_avg_tokens'] = str(np.mean(eff_lengths))
+        metadata['effective_set_total_tokens'] = str(sum(eff_lengths))
+    
+    # Environment
     metadata['transformers_version'] = transformers.__version__
     metadata['torch_version'] = torch.__version__
-    
-    # Add convergence info and final entropies
-    metadata.update(convergence_info)
-    metadata.update(final_entropies)
     
     table = pa.Table.from_pydict(data)
     table = table.replace_schema_metadata(metadata)
     
     pq.write_table(table, str(path))
     print(f"Saved results to {path}")
-    print(f"  - {len(sequences)} sequences saved")
-    print(f"  - Can reconstruct bins at any length from raw sequences")
 
 
-def estimate_bin_entropy(
+def estimate_prefix_mass(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     prefix: str,
-    bin_prefix_lens: List[int],
-    max_samples: int = 10000,
+    prefix_len: int,
+    prob_threshold: float = 0.9,
+    similarity_threshold: float = 0.85,
+    max_samples: int = 100000,
     max_len: int = 100,
     use_chat_template: bool = True,
     device: str = "cuda",
-    variance_threshold: float = 1e-4,
     offset: float = 0.0,
     batch_size: int = 128,
     display_interval: int = 128,
@@ -244,72 +307,53 @@ def estimate_bin_entropy(
     model_name: Optional[str] = None,
 ) -> Dict:
     """
-    Estimate empirical bin entropy for multiple bin prefix lengths.
+    Sample sequences until cumulative prefix probability mass exceeds threshold.
     
-    For each bin length, we:
-    1. Extract first N tokens from each generation (padding with EOS if needed)
-    2. Count frequency of each unique bin
-    3. Compute H = -Σ (count/total) * log2(count/total)
-    4. Track convergence and stop when variance < threshold
+    Algorithm:
+    1. Sample sequences using VdC codes
+    2. Extract prefix of length prefix_len from each sequence
+    3. Track discovered prefixes and their probabilities
+    4. Stop when sum of discovered prefix probs > prob_threshold
+    5. Cluster sequences by similarity to get effective support set
     
     Args:
         model: Language model
         tokenizer: Tokenizer
-        prefix: Text prefix to condition on (empty string "" = BOS-only)
-        bin_prefix_lens: List of bin lengths to track (e.g., [1, 2, 4, 8])
-        max_samples: Maximum number of samples (hard stop)
+        prefix: Text prefix to condition on
+        prefix_len: Length of prefix pattern to track
+        prob_threshold: Stop when cumulative prefix mass > this (e.g., 0.9)
+        similarity_threshold: Similarity threshold for deduplication (e.g., 0.85)
+        max_samples: Hard stop limit
         max_len: Maximum generation length per sample
         use_chat_template: Whether to format with chat template
         device: Device to run on
-        variance_threshold: Stop when variance of entropy in second half < threshold
-        offset: Cranley-Patterson rotation offset in [0, 1)
-        batch_size: Number of sequences to generate in parallel
-        display_interval: Update display every N samples (0 to disable)
-        save_path: Optional path for saving results (should end in .delm.parquet)
-                   Saves raw sequences so any bin length can be reconstructed
-        model_name: Model name/identifier to save in metadata
+        offset: Cranley-Patterson rotation offset
+        batch_size: Batch size for parallel sampling
+        display_interval: Update display every N samples
+        save_path: Optional path to save results
+        model_name: Model name for metadata
         
     Returns:
-        Dict with results for each bin length including entropy history,
-        convergence status, and final bin distributions
+        Dict with results including effective support set statistics
     """
-    
-    # Validate parameters
+    # Validate
     if not (0.0 <= offset < 1.0):
         raise ValueError("offset must be in [0, 1)")
+    if not (0.0 < prob_threshold <= 1.0):
+        raise ValueError("prob_threshold must be in (0, 1]")
+    if not (0.0 < similarity_threshold <= 1.0):
+        raise ValueError("similarity_threshold must be in (0, 1]")
+    if prefix_len <= 0:
+        raise ValueError("prefix_len must be positive")
     
-    if display_interval > 0:
-        if display_interval < batch_size:
-            raise ValueError(f"display_interval ({display_interval}) must be >= batch_size ({batch_size})")
-        if display_interval % batch_size != 0:
-            raise ValueError(f"display_interval ({display_interval}) must be a multiple of batch_size ({batch_size})")
-    
-    if not bin_prefix_lens:
-        raise ValueError("bin_prefix_lens cannot be empty")
-    
-    if any(l <= 0 for l in bin_prefix_lens):
-        raise ValueError("All bin_prefix_lens must be positive")
-    
-    # Prepare prefix
+    # Prepare prompt
     actual_prompt = None
     if prefix == "":
         if hasattr(tokenizer, 'bos_token_id') and tokenizer.bos_token_id is not None:
             prefix_ids = torch.tensor([[tokenizer.bos_token_id]], dtype=torch.long)
             actual_prompt = f"<BOS:{tokenizer.bos_token_id}>"
-            print(f"Using BOS-only unconditional mode (token_id={tokenizer.bos_token_id})")
-        elif hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None:
-            prefix_ids = torch.tensor([[tokenizer.pad_token_id]], dtype=torch.long)
-            actual_prompt = f"<PAD:{tokenizer.pad_token_id}>"
-            print(f"WARNING: No BOS token, using PAD token (token_id={tokenizer.pad_token_id})")
         else:
-            prefix_ids = tokenizer.encode("", return_tensors="pt", add_special_tokens=True)
-            if prefix_ids.shape[1] == 0:
-                prefix_ids = tokenizer.encode(" ", return_tensors="pt")
-                actual_prompt = " "
-                print("WARNING: No BOS/PAD token, using space as starting token")
-            else:
-                actual_prompt = "<empty_with_special_tokens>"
-                print("Using encoded empty string as unconditional start")
+            raise ValueError("Empty prefix requires BOS token")
     else:
         if use_chat_template:
             messages = [{"role": "user", "content": prefix}]
@@ -325,62 +369,52 @@ def estimate_bin_entropy(
         
         prefix_ids = tokenizer.encode(prompt, return_tensors="pt")
     
-    # Get EOS token ID
     eos_token_id = tokenizer.eos_token_id
     if eos_token_id is None:
         raise ValueError("Tokenizer has no EOS token ID")
     
-    # Generate VdC sequence
+    # Generate VdC codes
     codes = generate_vdc_sequence(max_samples)
-    
-    # Apply Cranley-Patterson rotation if offset is non-zero
     if offset > 0.0:
         codes = [(code + offset) % 1.0 for code in codes]
     
-    # Initialize incremental entropy tracking for each bin length
-    bin_data = {}
-    for bin_len in bin_prefix_lens:
-        bin_data[bin_len] = {
-            'tracker': IncrementalEntropyTracker(),
-            'converged': False,
-            'convergence_sample': None,
-        }
-    
-    # Store all sequences in order for saving
-    all_sequences = []
-    used_codes = []
-    terminated_flags = []
-    
-    # Get colors for each bin length (consistent throughout)
-    bin_colors = get_bin_colors(len(bin_prefix_lens))
+    # Tracking
+    discovered_prefixes: Set[tuple] = set()
+    prefix_first_seen: Dict[tuple, int] = {}  # Map prefix -> sample index
+    all_sequences: List[List[int]] = []
+    used_codes: List[float] = []
+    terminated_flags: List[bool] = []
+    mass_history: List[float] = []
     
     # Print header
-    if prefix == "":
-        print(f"\nSampling sequences unconditionally (BOS-only) with bin entropy estimation")
-    else:
-        print(f"\nSampling sequences for prefix: '{prefix[:50]}...'")
-    print(f"Bin prefix lengths: {bin_prefix_lens}")
-    print(f"Max Seq Length    : {max_len}")
-    print(f"Max samples       : {max_samples}")
-    print(f"Batch size        : {batch_size}")
-    print(f"Display interval  : {display_interval if display_interval > 0 else 'disabled (final only)'}")
-    print(f"Variance threshold: {variance_threshold}")
-    print(f"Offset            : {offset}")
+    print(f"\n{'='*80}")
+    print(f"PREFIX MASS SAMPLING")
+    print(f"{'='*80}")
+    print(f"Prompt: '{prefix[:50]}...'")
+    print(f"Prefix length    : {prefix_len}")
+    print(f"Prob threshold   : {prob_threshold}")
+    print(f"Similarity thresh: {similarity_threshold}")
+    print(f"Max samples      : {max_samples}")
+    print(f"Max seq length   : {max_len}")
+    print(f"Batch size       : {batch_size}")
+    print(f"Display interval : {display_interval}")
+    print(f"Offset           : {offset}")
     if save_path:
-        print(f"Save path         : {save_path}")
+        print(f"Save path        : {save_path}")
+    print()
     
     start_time = time.time()
-    last_plot_lines = 0
     samples_done = 0
-    all_converged = False
-    update_counter = 0  # Counter for cycling draw order
+    current_mass = 0.0
+    threshold_reached = False
+    last_display_lines = 0
     
     # Process in batches
     for batch_start in range(0, max_samples, batch_size):
         batch_end = min(batch_start + batch_size, max_samples)
         batch_codes = codes[batch_start:batch_end]
         
-        # Generate batch in parallel
+        # Generate batch
         batch_results = parallel_arithmetic_sample_batch(
             model=model,
             tokenizer=tokenizer,
@@ -390,223 +424,229 @@ def estimate_bin_entropy(
             device=device
         )
         
-        # Process each result and update bin counts
+        # Process results
+        newly_discovered = []
         for i, (tokens, log_prob, sample_info) in enumerate(batch_results):
             samples_done += 1
             
-            # Store sequence and code
+            # Store sequence
             all_sequences.append(tokens)
             used_codes.append(batch_codes[i])
             terminated_flags.append(sample_info['terminated_with_eos'])
             
-            # Extract bins for each length and update entropy incrementally
-            for bin_len in bin_prefix_lens:
-                bin_tuple = extract_bin_prefix(tokens, bin_len, eos_token_id)
-                tracker = bin_data[bin_len]['tracker']
-                tracker.update(bin_tuple)
-        
-        # Check convergence for each bin length
-        if samples_done >= 20:
-            all_converged = True
-            for bin_len in bin_prefix_lens:
-                if not bin_data[bin_len]['converged']:
-                    tracker = bin_data[bin_len]['tracker']
-                    half_point = samples_done // 2
-                    second_half = tracker.entropy_history[half_point:]
-                    
-                    if len(second_half) > 1:
-                        variance = np.var(second_half)
-                        if variance < variance_threshold:
-                            bin_data[bin_len]['converged'] = True
-                            bin_data[bin_len]['convergence_sample'] = samples_done
-                        else:
-                            all_converged = False
-                    else:
-                        all_converged = False
+            # Extract prefix
+            prefix_tuple = extract_prefix(tokens, prefix_len, eos_token_id)
             
-            if all_converged:
-                break
-        else:
-            all_converged = False
+            # Track if new
+            if prefix_tuple not in discovered_prefixes:
+                discovered_prefixes.add(prefix_tuple)
+                prefix_first_seen[prefix_tuple] = samples_done
+                newly_discovered.append(prefix_tuple)
+        
+        # Update mass if we found new prefixes
+        if newly_discovered:
+            # Compute exact probabilities for newly discovered prefixes
+            new_probs = compute_prefix_probabilities(
+                model, tokenizer, prefix_ids, set(newly_discovered), device
+            )
+            
+            # Update total mass
+            for pattern in newly_discovered:
+                current_mass += new_probs.get(pattern, 0.0)
+        
+        mass_history.append((samples_done, current_mass))
+        
+        # Check threshold
+        if current_mass >= prob_threshold:
+            threshold_reached = True
+            print(f"\n{'='*80}")
+            print(f"THRESHOLD REACHED at sample {samples_done}")
+            print(f"Cumulative prefix mass: {current_mass:.6f} >= {prob_threshold}")
+            print(f"{'='*80}\n")
+            break
         
         # Display update
-        should_display = (display_interval > 0 and samples_done % display_interval == 0)
-        
-        if should_display:
+        if display_interval > 0 and samples_done % display_interval == 0:
             elapsed = time.time() - start_time
             samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
             
-            # Clear previous display
-            if last_plot_lines > 0:
-                clear_lines(last_plot_lines)
+            if last_display_lines > 0:
+                clear_lines(last_display_lines)
             
-            # Plot combined view with cycled draw order but consistent colors
+            # Plot mass convergence
             plt.clf()
+            x_vals = [x for x, _ in mass_history]
+            y_vals = [y for _, y in mass_history]
             
-            # Cycle the drawing order to show overlapping lines better
-            n_lens = len(bin_prefix_lens)
-            draw_order = [(i + update_counter) % n_lens for i in range(n_lens)]
+            # If we're still below half the threshold, plot the smallest 1/2^k threshold above current max
+            y_max = max(y_vals) if y_vals else 0.0
+            half_thresh = prob_threshold / 2.0
             
-            for idx in draw_order:
-                bin_len = bin_prefix_lens[idx]
-                color = bin_colors[idx]  # Color stays with the bin length, not draw order
-                tracker = bin_data[bin_len]['tracker']
-                history = tracker.entropy_history
-                plt.plot(range(1, len(history) + 1), history, label=f"len={bin_len}", color=color)
+            if y_max < half_thresh:
+                # Show ONLY the 1/2**k guide line
+                if y_max > 0.0:
+                    # Choose k so that threshold/2**k is the smallest value strictly > y_max
+                    k = int(np.floor(np.log2(prob_threshold / y_max)))
+                    if (prob_threshold / (2 ** k)) <= y_max:
+                        k -= 1
+                    k = max(k, 1)
+                else:
+                    # If y_max == 0, just use 1/2**1 as a sane first guide
+                    k = 1
             
-            plt.title("Bin Entropy Convergence - All Lengths")
+                guide = prob_threshold / (2 ** k)
+                plt.plot(
+                    x_vals,
+                    [guide] * len(x_vals),
+                    color='yellow',
+                    label=f"1/2**{k} threshold"
+                )
+            else:
+                # Show ONLY the full threshold line
+                plt.plot(
+                    x_vals,
+                    [prob_threshold] * len(x_vals),
+                    color='red',
+                    label='threshold'
+                )
+            
+            # Mass curve LAST (on top)
+            plt.plot(
+                x_vals,
+                y_vals,
+                color='cyan',
+                label='cumulative mass'
+            )
+            
+            plt.title(f"Cumulative Prefix Mass (len={prefix_len})")
             plt.xlabel("Sample")
-            plt.ylabel("Entropy (bits)")
+            plt.ylabel("Probability Mass")
             plt.plotsize(100, 20)
             plt.show()
             
-            last_plot_lines = 20
+            last_display_lines = 20
             
-            # Stats line
-            elapsed_min = int(elapsed // 60)
-            elapsed_sec = int(elapsed % 60)
-            samples_left = max_samples - samples_done
-            eta_sec = samples_left / samples_per_sec if samples_per_sec > 0 else 0
-            eta_min = int(eta_sec // 60)
-            eta_sec_remainder = int(eta_sec % 60)
-            
-            converged_status = []
-            for bin_len in bin_prefix_lens:
-                status = "✓" if bin_data[bin_len]['converged'] else "..."
-                converged_status.append(f"L{bin_len}:{status}")
-            
-            print(f"[RUNNING] [{samples_done}/{max_samples}] | " +
-                  " ".join(converged_status) +
-                  f" | {samples_per_sec:.1f} samp/s | " +
-                  f"Elapsed: {elapsed_min}m{elapsed_sec:02d}s | " +
-                  f"ETA: {eta_min}m{eta_sec_remainder:02d}s")
-            last_plot_lines += 1
-            
-            update_counter += 1  # Increment for next update
+            # Status line
+            print(f"[SAMPLING] {samples_done}/{max_samples} | " +
+                  f"Mass: {current_mass:.4f}/{prob_threshold} | " +
+                  f"Unique: {len(discovered_prefixes)} | " +
+                  f"{samples_per_sec:.1f} samp/s")
+            last_display_lines += 1
+    
+    elapsed = time.time() - start_time
+    
+    # Compute exact probabilities for all discovered prefixes
+    print(f"\nComputing exact probabilities for {len(discovered_prefixes)} unique prefixes...")
+    prefix_probs = compute_prefix_probabilities(
+        model, tokenizer, prefix_ids, discovered_prefixes, device
+    )
+    
+    # Recompute final mass from exact probabilities
+    final_mass = sum(prefix_probs.values())
+    
+    # Cluster sequences to get effective support set
+    print(f"\nClustering {len(all_sequences)} sequences (similarity >= {similarity_threshold})...")
+    effective_set_indices = cluster_sequences(all_sequences, tokenizer, similarity_threshold)
+    
+    # Compute statistics
+    effective_sequences = [all_sequences[i] for i in effective_set_indices]
+    effective_lengths = [len(seq) for seq in effective_sequences]
     
     # Final display
-    elapsed = time.time() - start_time
-    samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
+    if display_interval > 0 and last_display_lines > 0:
+        clear_lines(last_display_lines)
     
-    # Clear previous display if it exists
-    if display_interval > 0 and last_plot_lines > 0:
-        clear_lines(last_plot_lines)
+    print(f"\n{'='*80}")
+    print(f"RESULTS")
+    print(f"{'='*80}")
+    print(f"Status: {'THRESHOLD REACHED' if threshold_reached else 'MAX SAMPLES'}")
+    print(f"Total samples: {samples_done}")
+    print(f"Unique prefixes (len={prefix_len}): {len(discovered_prefixes)}")
+    print(f"Final prefix mass: {final_mass:.6f}")
+    print(f"\nEffective Support Set:")
+    print(f"  Size: {len(effective_set_indices)} sequences")
+    print(f"  Total tokens: {sum(effective_lengths)}")
+    print(f"  Min tokens: {min(effective_lengths)}")
+    print(f"  Max tokens: {max(effective_lengths)}")
+    print(f"  Avg tokens: {np.mean(effective_lengths):.1f}")
+    print(f"\nTime: {elapsed:.1f}s ({samples_done/elapsed:.1f} samp/s)")
+    print(f"{'='*80}\n")
     
-    # Final combined plot - USE DEFAULT ORDER
-    print("\n" + "="*80)
-    print("COMBINED VIEW")
-    print("="*80)
-    plt.clf()
-    for idx, bin_len in enumerate(bin_prefix_lens):
-        color = bin_colors[idx]
-        tracker = bin_data[bin_len]['tracker']
-        history = tracker.entropy_history
-        plt.plot(range(1, len(history) + 1), history, label=f"len={bin_len}", color=color)
-    plt.title("Bin Entropy Convergence - All Lengths")
-    plt.xlabel("Sample")
-    plt.ylabel("Entropy (bits)")
-    plt.plotsize(100, 20)
-    plt.show()
-    
-    # Final stats
-    elapsed_min = int(elapsed // 60)
-    elapsed_sec = int(elapsed % 60)
-    
-    status = "ALL CONVERGED" if all_converged else "COMPLETED"
-    print(f"\n[{status}] Samples: {samples_done}/{max_samples} | " +
-          f"Speed: {samples_per_sec:.1f} samp/s | " +
-          f"Total: {elapsed_min}m{elapsed_sec:02d}s")
-    
-    print("\nFinal Entropies:")
-    for bin_len in bin_prefix_lens:
-        tracker = bin_data[bin_len]['tracker']
-        final_entropy = tracker.entropy_history[-1] if tracker.entropy_history else 0.0
-        n_unique = len(tracker.counts)
-        converged = "✓" if bin_data[bin_len]['converged'] else "✗"
-        conv_sample = bin_data[bin_len]['convergence_sample'] or "N/A"
-        print(f"  len={bin_len:2d}: H={final_entropy:8.3f} bits | " +
-              f"Unique bins: {n_unique:6d} | " +
-              f"Converged: {converged} (at sample {conv_sample})")
-    
-    # Package results - convert tracker data to dict format
-    results_bin_data = {}
-    for bin_len in bin_prefix_lens:
-        tracker = bin_data[bin_len]['tracker']
-        results_bin_data[bin_len] = {
-            'counts': dict(tracker.counts),
-            'entropy_history': tracker.entropy_history,
-            'converged': bin_data[bin_len]['converged'],
-            'convergence_sample': bin_data[bin_len]['convergence_sample'],
-        }
-    
+    # Package results
     results = {
-        'prefix': prefix if prefix != "" else "[BOS-only unconditional]",
-        'bin_prefix_lens': bin_prefix_lens,
+        'prefix': prefix,
+        'prefix_len': prefix_len,
+        'prob_threshold': prob_threshold,
+        'similarity_threshold': similarity_threshold,
         'samples_done': samples_done,
-        'all_converged': all_converged,
-        'bin_data': results_bin_data,
+        'threshold_reached': threshold_reached,
+        'unique_prefixes': len(discovered_prefixes),
+        'final_mass': final_mass,
+        'effective_set_size': len(effective_set_indices),
+        'effective_set_indices': effective_set_indices,
+        'effective_set_stats': {
+            'total_tokens': sum(effective_lengths),
+            'min_tokens': min(effective_lengths) if effective_lengths else 0,
+            'max_tokens': max(effective_lengths) if effective_lengths else 0,
+            'avg_tokens': np.mean(effective_lengths) if effective_lengths else 0,
+        },
         'elapsed_time': elapsed,
-        'variance_threshold': variance_threshold,
     }
     
-    # Save if requested with full metadata
+    # Save if requested
     if save_path:
-        # Get dtype string
-        dtype_str = str(next(model.parameters()).dtype) if hasattr(model, 'parameters') else None
-        
-        # Get device map if it was set
-        device_map_str = getattr(model, 'hf_device_map', None)
-        if device_map_str is not None:
-            device_map_str = str(device_map_str)
-        
-        save_bin_results(
-            results=results,
+        save_mass_results(
             sequences=all_sequences,
             codes=used_codes,
             terminated=terminated_flags,
+            prefix_probs=prefix_probs,
+            discovered_prefixes=list(discovered_prefixes),
+            mass_history=mass_history,
+            effective_set_indices=effective_set_indices,
             save_path=save_path,
             model_name=model_name,
             tokenizer_name=tokenizer.name_or_path if hasattr(tokenizer, 'name_or_path') else None,
             actual_prompt=actual_prompt,
+            prefix_len=prefix_len,
+            prob_threshold=prob_threshold,
+            similarity_threshold=similarity_threshold,
             max_len=max_len,
             batch_size=batch_size,
-            display_interval=display_interval,
-            use_chat_template=use_chat_template,
             offset=offset,
-            torch_dtype=dtype_str,
-            device_map=device_map_str,
+            total_mass=final_mass,
+            n_unique_prefixes=len(discovered_prefixes),
+            elapsed_time=elapsed,
         )
     
     return results
 
 
 if __name__ == "__main__":
-    # Test with a small model
+    # Test
     print("Loading Qwen2.5-1.5B-Instruct...")
     model_name = "Qwen/Qwen2.5-1.5B-Instruct"
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         device_map="auto"
     )
     
-    # Test with multiple bin lengths and save results
-    results = estimate_bin_entropy(
+    # Test prefix mass sampling
+    results = estimate_prefix_mass(
         model=model,
         tokenizer=tokenizer,
         prefix="What is the capital of France?",
-        bin_prefix_lens=[1, 2, 4, 8],
+        prefix_len=4,
+        prob_threshold=0.9,
+        similarity_threshold=0.85,
         max_samples=10000,
         max_len=32,
         batch_size=128,
         display_interval=256,
-        variance_threshold=1e-3,
-        save_path="results/capital_of_france.delm.parquet",
+        save_path="results/capital_mass.delm.parquet",
         model_name=model_name,
     )
     
-    print("\n" + "="*80)
-    print("TEST COMPLETE")
-    print("="*80)
+    print("\nTEST COMPLETE")
