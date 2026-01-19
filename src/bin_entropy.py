@@ -17,6 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import plotext as plt
 import transformers
 import Levenshtein  # pip install python-Levenshtein
+import tqdm
 
 from src.vdc import generate_vdc_sequence
 from src.arithmetic import parallel_arithmetic_sample_batch
@@ -54,9 +55,11 @@ def compute_prefix_probabilities(
     prompt_ids: torch.Tensor,
     prefix_patterns: Set[tuple],
     device: str = "cuda",
+    max_batch_size: int = 128,
 ) -> Dict[tuple, float]:
     """
     Compute exact probabilities for a set of prefix patterns.
+    Now correctly handles each pattern's own history in parallel.
     
     Args:
         model: Language model
@@ -64,6 +67,7 @@ def compute_prefix_probabilities(
         prompt_ids: Prompt token IDs [1, seq_len]
         prefix_patterns: Set of prefix tuples to compute probs for
         device: Device to run on
+        max_batch_size: Maximum batch size for processing (to control memory)
         
     Returns:
         Dict mapping prefix tuple -> probability
@@ -74,40 +78,55 @@ def compute_prefix_probabilities(
     model.eval()
     prefix_probs = {}
     
-    with torch.no_grad():
-        # Group prefixes by length for efficiency
-        by_length = defaultdict(list)
-        for pattern in prefix_patterns:
-            by_length[len(pattern)].append(pattern)
-        
-        for length, patterns in by_length.items():
-            # Start with prompt
-            input_ids = prompt_ids.to(device)
-            cumulative_log_prob = 0.0
-            
-            # For each position in the prefix
-            for pos in range(length):
-                outputs = model(input_ids)
-                logits = outputs.logits[:, -1, :]  # [1, vocab_size]
-                log_probs = torch.log_softmax(logits, dim=-1)
-                
-                # Compute probability for each pattern's token at this position
-                for pattern in patterns:
-                    token_id = pattern[pos]
-                    if pos == 0:
-                        prefix_probs[pattern] = log_probs[0, token_id].item()
-                    else:
-                        prefix_probs[pattern] += log_probs[0, token_id].item()
-                
-                # For next iteration, we need to continue with one token
-                # (doesn't matter which for independent computations)
-                if pos < length - 1:
-                    next_token = torch.tensor([[patterns[0][pos]]], device=device)
-                    input_ids = torch.cat([input_ids, next_token], dim=1)
+    # Group prefixes by length for efficiency
+    by_length = defaultdict(list)
+    for pattern in prefix_patterns:
+        by_length[len(pattern)].append(pattern)
     
-    # Convert log probs to probs
-    for pattern in prefix_probs:
-        prefix_probs[pattern] = np.exp(prefix_probs[pattern])
+    # Process each length group
+    for length, patterns in by_length.items():
+        # Process in chunks if needed to control memory
+        for chunk_start in range(0, len(patterns), max_batch_size):
+            chunk_end = min(chunk_start + max_batch_size, len(patterns))
+            chunk_patterns = patterns[chunk_start:chunk_end]
+            batch_size = len(chunk_patterns)
+            
+            with torch.no_grad():
+                # Repeat prompt for batch - each row will follow its own pattern
+                input_ids = prompt_ids.repeat(batch_size, 1).to(device)  # [B, prompt_len]
+                
+                # Initialize log probs accumulator for each pattern
+                log_probs_accum = torch.zeros(batch_size, device=device)
+                
+                # For each position in the prefix
+                for pos in range(length):
+                    # Forward pass for entire batch
+                    outputs = model(input_ids)
+                    logits = outputs.logits[:, -1, :]  # [B, vocab_size]
+                    log_probs = torch.log_softmax(logits, dim=-1)  # [B, vocab_size]
+                    
+                    # Gather log prob for each pattern's token at this position
+                    token_ids = torch.tensor(
+                        [pattern[pos] for pattern in chunk_patterns],
+                        device=device
+                    )  # [B]
+                    
+                    # Get log prob for each pattern's specific token
+                    token_log_probs = log_probs[torch.arange(batch_size, device=device), token_ids]  # [B]
+                    log_probs_accum += token_log_probs
+                    
+                    # Append each pattern's own token for next iteration
+                    # This is the KEY FIX: each row gets its own token, not pattern[0]'s token
+                    if pos < length - 1:
+                        input_ids = torch.cat([
+                            input_ids,
+                            token_ids.unsqueeze(1)
+                        ], dim=1)  # [B, prompt_len + pos + 1]
+            
+            # Convert log probs to probs and store
+            probs = torch.exp(log_probs_accum).cpu().numpy()
+            for i, pattern in enumerate(chunk_patterns):
+                prefix_probs[pattern] = float(probs[i])
     
     return prefix_probs
 
@@ -164,7 +183,7 @@ def cluster_sequences(
     
     representatives = [0]  # Start with first sequence
     
-    for i in range(1, len(sequences)):
+    for i in tqdm.tqdm(range(1, len(sequences)), desc="Deduplicating", unit="seq"):
         is_duplicate = False
         
         # Check against all representatives
@@ -302,7 +321,7 @@ def estimate_prefix_mass(
     device: str = "cuda",
     offset: float = 0.0,
     batch_size: int = 128,
-    display_interval: int = 128,
+    display_interval: int = 64,
     save_path: Optional[str] = None,
     model_name: Optional[str] = None,
 ) -> Dict:
@@ -329,7 +348,7 @@ def estimate_prefix_mass(
         device: Device to run on
         offset: Cranley-Patterson rotation offset
         batch_size: Batch size for parallel sampling
-        display_interval: Update display every N samples
+        display_interval: Update display every N samples (default 64)
         save_path: Optional path to save results
         model_name: Model name for metadata
         
@@ -384,7 +403,7 @@ def estimate_prefix_mass(
     all_sequences: List[List[int]] = []
     used_codes: List[float] = []
     terminated_flags: List[bool] = []
-    mass_history: List[float] = []
+    mass_history: List[float] = [(0, 0.0)]
     
     # Print header
     print(f"\n{'='*80}")
@@ -456,16 +475,7 @@ def estimate_prefix_mass(
         
         mass_history.append((samples_done, current_mass))
         
-        # Check threshold
-        if current_mass >= prob_threshold:
-            threshold_reached = True
-            print(f"\n{'='*80}")
-            print(f"THRESHOLD REACHED at sample {samples_done}")
-            print(f"Cumulative prefix mass: {current_mass:.6f} >= {prob_threshold}")
-            print(f"{'='*80}\n")
-            break
-        
-        # Display update
+        # Display update - CHECK THIS FIRST (before threshold check)
         if display_interval > 0 and samples_done % display_interval == 0:
             elapsed = time.time() - start_time
             samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
@@ -526,17 +536,86 @@ def estimate_prefix_mass(
             
             last_display_lines = 20
             
-            # Status line
-            print(f"[SAMPLING] {samples_done}/{max_samples} | " +
-                  f"Mass: {current_mass:.4f}/{prob_threshold} | " +
-                  f"Unique: {len(discovered_prefixes)} | " +
-                  f"{samples_per_sec:.1f} samp/s")
-            last_display_lines += 1
+            # Status line with ETA predictions
+            status_lines = []
+            status_lines.append(
+                f"[SAMPLING] {samples_done}/{max_samples} | " +
+                f"Mass: {current_mass:.4f}/{prob_threshold} | " +
+                f"Unique: {len(discovered_prefixes)} | " +
+                f"{samples_per_sec:.1f} samp/s"
+            )
+            
+            # Predict ETA to threshold based on mass accumulation rate
+            if len(mass_history) >= 3 and current_mass > 0:
+                # Calculate mass accumulation rate from recent history
+                recent_window = min(5, len(mass_history))
+                recent_samples = [mass_history[i][0] for i in range(-recent_window, 0)]
+                recent_masses = [mass_history[i][1] for i in range(-recent_window, 0)]
+                
+                if len(recent_masses) >= 2:
+                    sample_diff = recent_samples[-1] - recent_samples[0]
+                    mass_diff = recent_masses[-1] - recent_masses[0]
+                    
+                    if mass_diff > 0 and sample_diff > 0:
+                        mass_per_sample = mass_diff / sample_diff
+                        remaining_mass = prob_threshold - current_mass
+                        predicted_samples = remaining_mass / mass_per_sample
+                        predicted_time = predicted_samples / samples_per_sec if samples_per_sec > 0 else float('inf')
+                        
+                        pred_eta_min = int(predicted_time // 60)
+                        pred_eta_sec = int(predicted_time % 60)
+                        
+                        # Check if we'll exceed max_samples
+                        total_predicted_samples = samples_done + predicted_samples
+                        
+                        if total_predicted_samples <= max_samples:
+                            status_lines.append(
+                                f"  Predicted: {int(predicted_samples)} more samples needed | " +
+                                f"ETA to threshold: {pred_eta_min}m{pred_eta_sec:02d}s"
+                            )
+                        else:
+                            samples_at_max = max_samples - samples_done
+                            time_at_max = samples_at_max / samples_per_sec if samples_per_sec > 0 else 0
+                            max_eta_min = int(time_at_max // 60)
+                            max_eta_sec = int(time_at_max % 60)
+                            
+                            predicted_mass_at_max = current_mass + (mass_per_sample * samples_at_max)
+                            
+                            status_lines.append(
+                                f"  ⚠ Predicted: {int(predicted_samples)} samples needed but max is {max_samples}"
+                            )
+                            status_lines.append(
+                                f"  At max_samples: mass ≈ {predicted_mass_at_max:.4f} | " +
+                                f"ETA to max: {max_eta_min}m{max_eta_sec:02d}s"
+                            )
+                            status_lines.append(
+                                f"  Would need {int(predicted_samples)} samples | " +
+                                f"Would take ≈ {pred_eta_min}m{pred_eta_sec:02d}s total"
+                            )
+            
+            for line in status_lines:
+                print(line)
+            last_display_lines += len(status_lines)
+        
+        # Check threshold - CHECK THIS SECOND (after display)
+        if current_mass >= prob_threshold:
+            threshold_reached = True
+            
+            # Clear the last display before showing completion message
+            # if last_display_lines > 0:
+            #     clear_lines(last_display_lines)
+            #     last_display_lines = 0
+            
+            print(f"\n{'='*80}")
+            print(f"THRESHOLD REACHED at sample {samples_done}")
+            print(f"Cumulative prefix mass: {current_mass:.6f} >= {prob_threshold}")
+            print(f"{'='*80}\n")
+            break
     
     elapsed = time.time() - start_time
     
     # Compute exact probabilities for all discovered prefixes
-    print(f"\nComputing exact probabilities for {len(discovered_prefixes)} unique prefixes...")
+    print(f"Computing exact probabilities for {len(discovered_prefixes)} unique prefixes...")
     prefix_probs = compute_prefix_probabilities(
         model, tokenizer, prefix_ids, discovered_prefixes, device
     )
@@ -552,10 +631,7 @@ def estimate_prefix_mass(
     effective_sequences = [all_sequences[i] for i in effective_set_indices]
     effective_lengths = [len(seq) for seq in effective_sequences]
     
-    # Final display
-    if display_interval > 0 and last_display_lines > 0:
-        clear_lines(last_display_lines)
-    
+    # Final display (no need to clear lines here since we already did)
     print(f"\n{'='*80}")
     print(f"RESULTS")
     print(f"{'='*80}")
@@ -644,7 +720,7 @@ if __name__ == "__main__":
         max_samples=10000,
         max_len=32,
         batch_size=128,
-        display_interval=256,
+        display_interval=128,
         save_path="results/capital_mass.delm.parquet",
         model_name=model_name,
     )
