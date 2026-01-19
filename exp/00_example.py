@@ -30,6 +30,7 @@ def main():
     prob_threshold = 0.1  # Stop when 90% of prefix mass is discovered
     similarity_threshold = 0.85  # More than 85% similarity will be considered deduplication
     max_samples = 262144
+    batch_size = 512
     
     # Load model once
     print(f"Loading {model_name}...")
@@ -63,7 +64,7 @@ def main():
             max_samples=max_samples,  # Hard limit
             max_len=max_len,
             use_chat_template=use_chat,
-            batch_size=128,
+            batch_size=batch_size,
             display_interval=256,
             save_path=f"results/{save_name}.delm.parquet",
             model_name=model_name,
