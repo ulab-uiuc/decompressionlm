@@ -2,10 +2,9 @@
 """
 Example script for prefix mass-based sampling.
 
-This demonstrates the new algorithm:
+This demonstrates the algorithm:
 1. Sample sequences until cumulative prefix probability mass > threshold
-2. Cluster sequences by similarity to get effective support set
-3. Report statistics about the support set
+2. Report statistics about the effective support set
 """
 
 import torch
@@ -25,21 +24,22 @@ def main():
     ]
     
     # Sampling parameters
-    max_len = 256 # Max seqence length
-    prefix_len = 32  # Track first 4 tokens as prefix pattern
-    prob_threshold = 0.1  # Stop when 90% of prefix mass is discovered
-    similarity_threshold = 0.85  # More than 85% similarity will be considered deduplication
+    max_len = 256  # Max sequence length
+    prefix_len = 32  # Track first 32 tokens as prefix pattern
+    prob_threshold = 0.0001  # Stop when 10% of prefix mass is discovered
     max_samples = 262144
-    batch_size = 512
+    batch_size = 128
     
     # Load model once
+    # Here, we do not encourage loading in non-native dtypes as it might cause 
+    # numerical instability, and we don't have that much error handing right now.
     print(f"Loading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         device_map="auto"
-    )
+    )    
     
     # Run for each prompt
     for i, prompt in enumerate(prompts):
@@ -60,7 +60,6 @@ def main():
             prefix=prompt,
             prefix_len=prefix_len,
             prob_threshold=prob_threshold,
-            similarity_threshold=similarity_threshold,
             max_samples=max_samples,  # Hard limit
             max_len=max_len,
             use_chat_template=use_chat,
