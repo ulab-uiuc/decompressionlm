@@ -525,16 +525,20 @@ def estimate_prefix_mass(
                     prefix_prob = math.exp(prefix_log_prob)
                     prefix_probs[prefix_tuple] = prefix_prob
                     current_mass += prefix_prob
-
-                    if current_mass >= prob_threshold:
-                        threshold_reached = True
-                        batch_should_break = True
-                        break
                 else:
                     # Fallback: shouldn't happen with updated arithmetic.py
                     print("WARNING: per_token_log_probs not available, skipping this prefix")
 
+            # Check threshold after EVERY sample, not just new discoveries
+            if current_mass >= prob_threshold:
+                threshold_reached = True
+                batch_should_break = True
+                break
+
         mass_history.append((samples_done, current_mass))
+
+        if batch_should_break:
+            break
 
         # Periodic display update
         if display_interval > 0 and samples_done % display_interval == 0:
@@ -586,7 +590,8 @@ def estimate_prefix_mass(
                 f"Elapsed: {elapsed_str}"
             )
 
-            if len(mass_history) >= 3 and current_mass > 0:
+            # Only show predictions if we haven't reached threshold yet
+            if current_mass < prob_threshold and len(mass_history) >= 3:
                 recent_window = min(5, len(mass_history))
                 recent_samples = [mass_history[i][0] for i in range(-recent_window, 0)]
                 recent_masses = [mass_history[i][1] for i in range(-recent_window, 0)]

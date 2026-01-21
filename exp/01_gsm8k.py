@@ -5,18 +5,23 @@ GSM8K meta-question prefix-mass sampling experiment.
 import os
 import torch
 import gc
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Qwen2_5OmniForConditionalGeneration,
+    Qwen2_5OmniProcessor,
+)
 from src.bin_entropy import estimate_prefix_mass
 
 
 def main():
     models = [
         # "google/gemma-3-27b-it",
-        "Qwen/Qwen2.5-14B-Instruct",
-        "google/gemma-3-12b-it",
-        "Qwen/Qwen2.5-7B-Instruct",
+        # "Qwen/Qwen2.5-14B-Instruct",
+        # "google/gemma-3-12b-it",
+        # "Qwen/Qwen2.5-7B-Instruct",
         # "google/gemma-3-4b-it",
-        "Qwen/Qwen2.5-Omni-7B-Instruct",
+        "Qwen/Qwen2.5-Omni-7B",
         # "microsoft/phi-4-mini-instruct",
         # "microsoft/Phi-3.5-mini-instruct",
         "Qwen/Qwen2.5-Coder-7B-Instruct",
@@ -56,12 +61,21 @@ def main():
         
         # Load model and tokenizer
         print(f"Loading model and tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=torch.bfloat16,
-            device_map="auto"
-        )
+        if model_name == "Qwen/Qwen2.5-Omni-7B":
+            processor = Qwen2_5OmniProcessor.from_pretrained(model_name)
+            model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+                model_name,
+                dtype=torch.bfloat16,
+                device_map="auto"
+            )
+            tokenizer = processor.tokenizer
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                dtype=torch.bfloat16,
+                device_map="auto"
+            )
 
         try:
             # Run experiment (with automatic caching/validation)
