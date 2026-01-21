@@ -111,7 +111,7 @@ def parallel_arithmetic_sample_batch(
     codes: List[float],
     max_len: int = 100,
     device: str = "cuda",
-) -> List[Tuple[List[int], float, dict]]:
+) -> List[Tuple[List[int], float, dict, List[float]]]:
     """
     Sample multiple sequences in parallel using batched forward passes.
     
@@ -124,7 +124,7 @@ def parallel_arithmetic_sample_batch(
         device: Device to run on
         
     Returns:
-        List of (tokens, total_log_prob, info) for each sequence
+        List of (tokens, total_log_prob, info, per_token_log_probs) for each sequence
     """
     batch_size = len(codes)
     model.eval()
@@ -137,7 +137,7 @@ def parallel_arithmetic_sample_batch(
     current_codes = torch.tensor(codes, dtype=torch.float32, device=device)
     generated_tokens = [[] for _ in range(batch_size)]
     total_log_probs = torch.zeros(batch_size, device=device)
-    per_seq_log_probs = [[] for _ in range(batch_size)]
+    per_token_log_probs_list = [[] for _ in range(batch_size)]  # Track per-token log probs
     
     with torch.no_grad():
         # Initial forward pass with shared prefix
@@ -157,7 +157,7 @@ def parallel_arithmetic_sample_batch(
                     tid = token_ids_batch[i].item()
                     lp = log_probs_batch[i].item()
                     
-                    per_seq_log_probs[i].append(lp)
+                    per_token_log_probs_list[i].append(lp)  # Store per-token log prob
                     total_log_probs[i] += lp
                     
                     if tid == tokenizer.eos_token_id:
@@ -192,13 +192,18 @@ def parallel_arithmetic_sample_batch(
     results = []
     for i in range(batch_size):
         info = {
-            'per_token_log_probs': per_seq_log_probs[i],
             'num_tokens': len(generated_tokens[i]),
             'terminated_with_eos': len(generated_tokens[i]) == 0 or not active_mask[i]
         }
-        results.append((generated_tokens[i], total_log_probs[i].item(), info))
+        results.append((
+            generated_tokens[i],
+            total_log_probs[i].item(),
+            info,
+            per_token_log_probs_list[i]  # NEW: include per-token log probs as 4th element
+        ))
     
     return results
+
 
 def arithmetic_sample_sequence(
     model: AutoModelForCausalLM,
@@ -208,7 +213,7 @@ def arithmetic_sample_sequence(
     max_len: int = 100,
     device: str = "cuda",
     use_cache: bool = True
-) -> Tuple[list[int], float, dict]:
+) -> Tuple[list[int], float, dict, List[float]]:
     """
     Sample a complete sequence autoregressively using arithmetic coding.
     
@@ -227,7 +232,8 @@ def arithmetic_sample_sequence(
     Returns:
         tokens: List of generated token IDs (excluding EOS)
         total_log_prob: Sum of log probabilities INCLUDING EOS if encountered
-        info: Dict with 'per_token_log_probs', 'num_tokens', 'terminated_with_eos'
+        info: Dict with 'num_tokens', 'terminated_with_eos'
+        per_token_log_probs: List of log probabilities for each token
     """
     # Just use the batched version with batch_size=1
     results = parallel_arithmetic_sample_batch(
@@ -272,18 +278,19 @@ if __name__ == "__main__":
     # Test parallel batching
     from src.vdc import generate_vdc_sequence
     
-    codes = generate_vdc_sequence(1024)
-    print("Testing parallel sampling with 1024 sequences:\n")
+    codes = generate_vdc_sequence(8)  # Test with small batch
+    print("Testing parallel sampling with 8 sequences:\n")
     
     results = parallel_arithmetic_sample_batch(
-        model, tokenizer, prefix_ids, codes, max_len=128
+        model, tokenizer, prefix_ids, codes, max_len=32
     )
     
-    for i, (tokens, log_prob, info) in enumerate(results):
+    for i, (tokens, log_prob, info, per_token_log_probs) in enumerate(results):
         text = tokenizer.decode(tokens, skip_special_tokens=True)
         print(f"Sequence {i+1}:")
         print(f"  Generated: {text[:100]}...")
         print(f"  Total log prob: {log_prob:.4f}")
         print(f"  Num tokens: {info['num_tokens']}")
+        print(f"  Per-token log probs: {per_token_log_probs[:5]}...")  # Show first 5
         print(f"  EOS: {info['terminated_with_eos']}")
         print()
