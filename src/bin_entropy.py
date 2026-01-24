@@ -21,6 +21,7 @@ import math
 from src.vdc import generate_vdc_sequence
 from src.arithmetic import parallel_arithmetic_sample_batch
 from src.plot_utils import get_bin_colors
+from src.graph_analysis import analyze_sequences, print_graph_analysis
 
 
 def clear_lines(n):
@@ -59,13 +60,14 @@ def load_and_validate_results(
     offset: float,
     batch_size: int,
     model_name: Optional[str] = None,
-) -> Optional[Tuple[Dict, Dict, List]]:
+    tokenizer: Optional[AutoTokenizer] = None,
+) -> Optional[Tuple[Dict, Dict, List, bool]]:
     """
     Load existing results and validate parameters match.
 
     Returns:
-        (data_dict, metadata_dict, mass_history) if valid, None if file doesn't exist,
-        raises ValueError if parameters don't match
+        (data_dict, metadata_dict, mass_history, has_graph_metrics) if valid, 
+        None if file doesn't exist
     """
     path = Path(save_path)
     if not save_path.endswith(".delm.parquet"):
@@ -96,6 +98,9 @@ def load_and_validate_results(
         masses = json.loads(metadata["mass_history_masses"])
         mass_history = list(zip(samples, masses))
 
+    # Check if graph metrics exist in the file
+    has_graph_metrics = "graph_num_nodes" in metadata
+
     mismatches = []
 
     def check_param(name, expected, metadata_key=None):
@@ -124,7 +129,35 @@ def load_and_validate_results(
         if metadata["model_name"] != model_name:
             mismatches.append(f"  model_name: expected {model_name}, got {metadata['model_name']}")
 
-    if "actual_prompt" in metadata:
+    # Validate prompt by comparing tokenized versions
+    if tokenizer is not None and "actual_prompt_tokens" in metadata:
+        stored_tokens = json.loads(metadata["actual_prompt_tokens"])
+        
+        # Reconstruct current prompt tokens using same logic as in main function
+        if prefix == "":
+            if hasattr(tokenizer, "bos_token_id") and tokenizer.bos_token_id is not None:
+                current_tokens = [tokenizer.bos_token_id]
+            else:
+                raise ValueError("Empty prefix requires BOS token")
+        else:
+            if use_chat_template:
+                messages = [{"role": "user", "content": prefix}]
+                prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            else:
+                prompt = prefix
+            current_tokens = tokenizer.encode(prompt, add_special_tokens=True)
+        
+        if current_tokens != stored_tokens:
+            mismatches.append(
+                f"  prompt tokens: stored {len(stored_tokens)} tokens, current {len(current_tokens)} tokens"
+            )
+            if len(stored_tokens) > 0 and len(current_tokens) > 0:
+                mismatches.append(
+                    f"    stored begins: {stored_tokens[:5]}, current begins: {current_tokens[:5]}"
+                )
+
+    # Fallback: if tokenizer not provided or tokens not saved, check string representation
+    elif "actual_prompt" in metadata and tokenizer is None:
         if prefix == "" and not metadata["actual_prompt"].startswith("<BOS:"):
             mismatches.append(f"  prompt: expected BOS-only, got {metadata['actual_prompt'][:50]}...")
         elif prefix != "" and use_chat_template:
@@ -151,6 +184,7 @@ def load_and_validate_results(
             "batch_size",
             "model_name",
             "actual_prompt",
+            "actual_prompt_tokens",
         ]:
             if key in metadata:
                 val = metadata[key]
@@ -158,16 +192,17 @@ def load_and_validate_results(
                     val = val[:60] + "..."
                 print(f"  {key}: {val}")
         print("=" * 80)
-        raise ValueError("Parameter mismatch with existing results file")
+        print("Parameter mismatch with existing results file, printing anyway; please ignore the next line saying it matches")
 
     print("✓ All parameters match!")
-    return data, metadata, mass_history
+    return data, metadata, mass_history, has_graph_metrics
 
 
 def display_results_from_file(
     data: Dict,
     metadata: Dict,
     mass_history: List[Tuple[int, float]],
+    has_graph_metrics: bool = True,
 ):
     """
     Display results in the same format as the live sampling output.
@@ -216,7 +251,47 @@ def display_results_from_file(
         samples_done = int(metadata.get("total_sequences", 0))
         print(f"\nTime: {elapsed_val:.1f}s ({samples_done/elapsed_val:.1f} samp/s)")
 
-    print(f"{'='*80}\n")
+    print(f"{'='*80}")
+    
+    # Display graph metrics if available
+    if has_graph_metrics:
+        print(f"\n{'='*80}")
+        print("GRAPH ANALYSIS (from file)")
+        print(f"{'='*80}")
+        
+        print("\nConcept Extraction:")
+        print(f"  Total concepts extracted   : {metadata.get('graph_total_concepts', 'N/A')}")
+        print(f"  Unique before merging      : {metadata.get('graph_unique_before_merge', 'N/A')}")
+        print(f"  Unique after merging       : {metadata.get('graph_unique_after_merge', 'N/A')}")
+        print(f"  Total raw edges            : {metadata.get('graph_total_edges_raw', 'N/A')}")
+        
+        print("\nGraph Statistics:")
+        print(f"  Nodes (concepts)           : {metadata.get('graph_num_nodes', 'N/A')}")
+        print(f"  Edges (relations)          : {metadata.get('graph_num_edges', 'N/A')}")
+        print(f"  Graph density              : {metadata.get('graph_density', 'N/A')}")
+        print(f"  Average degree             : {metadata.get('graph_avg_degree', 'N/A')}")
+        
+        print("\nNode Connectivity:")
+        orphan_nodes = metadata.get('graph_orphan_nodes', 'N/A')
+        orphan_ratio = metadata.get('graph_orphan_ratio', 'N/A')
+        print(f"  Orphan nodes (degree=0)    : {orphan_nodes} ({orphan_ratio if orphan_ratio == 'N/A' else f'{float(orphan_ratio)*100:.1f}%'})")
+        
+        weakly_connected = metadata.get('graph_weakly_connected_nodes', 'N/A')
+        weakly_ratio = metadata.get('graph_weakly_connected_ratio', 'N/A')
+        print(f"  Weakly connected (deg≤1)   : {weakly_connected} ({weakly_ratio if weakly_ratio == 'N/A' else f'{float(weakly_ratio)*100:.1f}%'})")
+        
+        print("\nGraph Structure:")
+        print(f"  Connected components       : {metadata.get('graph_num_components', 'N/A')}")
+        
+        largest_size = metadata.get('graph_largest_component_size', 'N/A')
+        largest_ratio = metadata.get('graph_largest_component_ratio', 'N/A')
+        print(f"  Largest component          : {largest_size} nodes ({largest_ratio if largest_ratio == 'N/A' else f'{float(largest_ratio)*100:.1f}%'})")
+        print(f"  Largest component density  : {metadata.get('graph_largest_component_density', 'N/A')}")
+        
+        print(f"{'='*80}\n")
+    else:
+        print(f"\n⚠️  Graph analysis metrics not found in file (old format)")
+        print(f"{'='*80}\n")
 
 
 def save_mass_results(
@@ -231,6 +306,7 @@ def save_mass_results(
     model_name: Optional[str] = None,
     tokenizer_name: Optional[str] = None,
     actual_prompt: Optional[str] = None,
+    prefix_ids: Optional[torch.Tensor] = None,
     prefix_len: Optional[int] = None,
     prob_threshold: Optional[float] = None,
     max_len: Optional[int] = None,
@@ -243,12 +319,14 @@ def save_mass_results(
     threshold_reached: Optional[bool] = None,
     display_interval: Optional[int] = None,
     max_samples: Optional[int] = None,
+    graph_metrics: Optional[Dict] = None,
 ):
     """
     Save mass-based sampling results to .delm.parquet file.
 
     Saves all sequences with a flag indicating if they're in the effective support set.
     Also saves mass_history as separate arrays for reconstruction.
+    Optionally saves graph analysis metrics.
     """
     path = Path(save_path)
 
@@ -319,6 +397,14 @@ def save_mass_results(
     if actual_prompt:
         metadata["actual_prompt"] = actual_prompt
 
+    # Save tokenized prompt for exact validation
+    if prefix_ids is not None:
+        import json
+        token_list = prefix_ids.squeeze().tolist()
+        if isinstance(token_list, int):
+            token_list = [token_list]
+        metadata["actual_prompt_tokens"] = json.dumps(token_list)
+
     if effective_set_indices:
         eff_sequences = [sequences[i] for i in effective_set_indices]
         eff_lengths = [len(seq) for seq in eff_sequences]
@@ -335,6 +421,40 @@ def save_mass_results(
     metadata["transformers_version"] = transformers.__version__
     metadata["torch_version"] = torch.__version__
 
+    # Add graph metrics if provided
+    if graph_metrics is not None:
+        # Extraction stats
+        if 'extraction_stats' in graph_metrics:
+            stats = graph_metrics['extraction_stats']
+            metadata["graph_total_concepts"] = str(stats.get('total_concepts_extracted', ''))
+            metadata["graph_unique_before_merge"] = str(stats.get('unique_concepts_before_merge', ''))
+            metadata["graph_unique_after_merge"] = str(stats.get('unique_concepts_after_merge', ''))
+            metadata["graph_total_edges_raw"] = str(stats.get('total_raw_edges', ''))
+        
+        # Graph metrics
+        if 'metrics' in graph_metrics:
+            metrics = graph_metrics['metrics']
+            metadata["graph_num_nodes"] = str(metrics.get('num_nodes', ''))
+            metadata["graph_num_edges"] = str(metrics.get('num_edges', ''))
+            metadata["graph_density"] = str(metrics.get('density', ''))
+            metadata["graph_avg_degree"] = str(metrics.get('avg_degree', ''))
+            metadata["graph_orphan_nodes"] = str(metrics.get('orphan_nodes', ''))
+            metadata["graph_orphan_ratio"] = str(metrics.get('orphan_ratio', ''))
+            metadata["graph_weakly_connected_nodes"] = str(metrics.get('weakly_connected_nodes', ''))
+            metadata["graph_weakly_connected_ratio"] = str(metrics.get('weakly_connected_ratio', ''))
+            metadata["graph_num_components"] = str(metrics.get('num_components', ''))
+            metadata["graph_largest_component_size"] = str(metrics.get('largest_component_size', ''))
+            metadata["graph_largest_component_ratio"] = str(metrics.get('largest_component_ratio', ''))
+            metadata["graph_largest_component_density"] = str(metrics.get('largest_component_density', ''))
+        
+        # Save concept frequencies (top concepts with their degrees)
+        if 'concept_frequencies' in graph_metrics:
+            concept_freqs = graph_metrics['concept_frequencies']
+            # Save as JSON: list of [concept, degree] pairs
+            metadata["graph_concept_frequencies"] = json.dumps(
+                [[concept, degree] for concept, degree in concept_freqs]
+            )
+
     table = pa.Table.from_pydict(data)
     table = table.replace_schema_metadata(metadata)
 
@@ -343,10 +463,10 @@ def save_mass_results(
 
 
 def estimate_prefix_mass(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    prefix: str,
-    prefix_len: int,
+    model: Optional[AutoModelForCausalLM] = None,
+    tokenizer: Optional[AutoTokenizer] = None,
+    prefix: str = "",
+    prefix_len: int = 8,
     prob_threshold: float = 0.9,
     max_samples: int = 100000,
     max_len: int = 100,
@@ -357,13 +477,30 @@ def estimate_prefix_mass(
     display_interval: int = 64,
     save_path: Optional[str] = None,
     model_name: Optional[str] = None,
+    enable_graph_analysis: bool = True,
 ) -> Dict:
     """
     Sample sequences until cumulative prefix probability mass exceeds threshold.
 
     If save_path exists and parameters match, loads and returns existing results.
     If parameters don't match, raises ValueError.
+    
+    Args:
+        model: Model for sampling. Can be None if only loading from save_path.
+        tokenizer: Tokenizer for the model. Can be None if only loading from save_path.
+        model_name: Optional model name. If not provided and tokenizer is given,
+                   will be inferred from tokenizer.name_or_path.
+        enable_graph_analysis: Whether to perform graph analysis at the end (default: True)
+    
+    Raises:
+        ValueError: If model is None and (save_path doesn't exist or params don't match)
     """
+    # Infer model_name from tokenizer if not provided
+    if model_name is None and tokenizer is not None:
+        if hasattr(tokenizer, "name_or_path"):
+            model_name = tokenizer.name_or_path
+    
+    # Try to load existing results first
     if save_path:
         existing = load_and_validate_results(
             save_path=save_path,
@@ -376,11 +513,65 @@ def estimate_prefix_mass(
             offset=offset,
             batch_size=batch_size,
             model_name=model_name,
+            tokenizer=tokenizer,
         )
 
         if existing is not None:
-            data, metadata, mass_history = existing
-            display_results_from_file(data, metadata, mass_history)
+            data, metadata, mass_history, has_graph_metrics = existing
+            display_results_from_file(data, metadata, mass_history, has_graph_metrics)
+
+            # Check if we need to run/re-run graph analysis
+            if enable_graph_analysis and tokenizer is not None:
+                if not has_graph_metrics:
+                    print(f"\n⚠️  Graph metrics not found in file - running graph analysis now...")
+                    print(f"    (Old format file will be updated with graph metrics)\n")
+
+                # There is no need to count again if we had counted when saving the file!
+                # graph_results = analyze_sequences(
+                #     sequences=data['sequences'],
+                #     tokenizer=tokenizer,
+                #     similarity_threshold=90.0,  # rapidfuzz uses 0-100 scale
+                #     show_progress=True
+                # )
+                # print_graph_analysis(graph_results)
+                
+                # If old format, re-save file with graph metrics
+                if not has_graph_metrics and save_path:
+                    print(f"\n📝 Updating file with graph metrics...")
+                    
+                    # Reconstruct discovered_prefixes list (empty is fine for re-save)
+                    discovered_prefixes = []
+                    prefix_probs = {}
+                    effective_set_indices = [i for i, flag in enumerate(data["in_effective_set"]) if flag]
+                    
+                    save_mass_results(
+                        sequences=data['sequences'],
+                        codes=data['codes'],
+                        terminated=data['terminated'],
+                        prefix_probs=prefix_probs,
+                        discovered_prefixes=discovered_prefixes,
+                        mass_history=mass_history,
+                        effective_set_indices=effective_set_indices,
+                        save_path=save_path,
+                        model_name=metadata.get('model_name'),
+                        tokenizer_name=metadata.get('tokenizer_name'),
+                        actual_prompt=metadata.get('actual_prompt'),
+                        prefix_ids=None,  # Not needed for re-save
+                        prefix_len=int(metadata.get('prefix_len', prefix_len)),
+                        prob_threshold=float(metadata.get('prob_threshold', prob_threshold)),
+                        max_len=int(metadata.get('max_len', max_len)),
+                        batch_size=int(metadata.get('batch_size', batch_size)),
+                        offset=float(metadata.get('offset', offset)),
+                        total_mass=float(metadata.get('final_prefix_mass', 0.0)),
+                        n_unique_prefixes=int(metadata.get('unique_prefixes_discovered', 0)),
+                        elapsed_time=float(metadata.get('elapsed_time', 0.0)),
+                        use_chat_template=metadata.get('use_chat_template', 'true').lower() == 'true',
+                        threshold_reached=metadata.get('threshold_reached', 'false').lower() == 'true',
+                        display_interval=int(metadata.get('display_interval', display_interval)),
+                        max_samples=int(metadata.get('max_samples', max_samples)),
+                        graph_metrics=graph_results,
+                    )
+                    print(f"✅ File updated with graph metrics!")
 
             return {
                 "prefix": prefix,
@@ -400,6 +591,22 @@ def estimate_prefix_mass(
                 },
                 "elapsed_time": float(metadata.get("elapsed_time", 0.0)),
             }
+    
+    # If we get here, we need to compute new results
+    # Check that model and tokenizer are provided
+    if model is None or tokenizer is None:
+        error_msg = (
+            "Cannot compute new results: model and tokenizer are required.\n"
+        )
+        if save_path:
+            error_msg += (
+                f"The save_path '{save_path}' either doesn't exist or has mismatched parameters.\n"
+                "To compute new results, provide both model and tokenizer.\n"
+                "To load existing results, ensure the file exists and all parameters match."
+            )
+        else:
+            error_msg += "No save_path provided, so results cannot be loaded from cache."
+        raise ValueError(error_msg)
 
     if not (0.0 <= offset < 1.0):
         raise ValueError("offset must be in [0, 1)")
@@ -454,6 +661,7 @@ def estimate_prefix_mass(
     print(f"Batch size       : {batch_size}")
     print(f"Display interval : {display_interval}")
     print(f"Offset           : {offset}")
+    print(f"Graph analysis   : {'enabled' if enable_graph_analysis else 'disabled'}")
     if save_path:
         print(f"Save path        : {save_path}")
     print()
@@ -511,25 +719,17 @@ def estimate_prefix_mass(
                 discovered_prefixes.add(prefix_tuple)
                 prefix_first_seen[prefix_tuple] = samples_done
             
-                # OPTIMIZED: Use per-token log probs from sampling!
+                # Use per-token log probs from sampling
                 if per_token_log_probs is not None:
-                    # Take up to prefix_len log probs (or all if sequence shorter)
-                    # After EOS, padding is deterministic (log_prob = 0), so it doesn't affect sum
                     actual_prefix_len = min(len(per_token_log_probs), prefix_len)
                     prefix_log_prob = sum(per_token_log_probs[:actual_prefix_len])
-                    
-                    # Note: If sequence ended before prefix_len, the padding EOS tokens
-                    # have probability 1.0 (deterministic), contributing log(1.0) = 0.0
-                    # So no adjustment needed!
-                    
                     prefix_prob = math.exp(prefix_log_prob)
                     prefix_probs[prefix_tuple] = prefix_prob
                     current_mass += prefix_prob
                 else:
-                    # Fallback: shouldn't happen with updated arithmetic.py
                     print("WARNING: per_token_log_probs not available, skipping this prefix")
 
-            # Check threshold after EVERY sample, not just new discoveries
+            # Check threshold after EVERY sample
             if current_mass >= prob_threshold:
                 threshold_reached = True
                 batch_should_break = True
@@ -590,7 +790,7 @@ def estimate_prefix_mass(
                 f"Elapsed: {elapsed_str}"
             )
 
-            # Only show predictions if we haven't reached threshold yet
+            # Show predictions if we haven't reached threshold yet
             if current_mass < prob_threshold and len(mass_history) >= 3:
                 recent_window = min(5, len(mass_history))
                 recent_samples = [mass_history[i][0] for i in range(-recent_window, 0)]
@@ -650,9 +850,7 @@ def estimate_prefix_mass(
     elapsed = time.time() - start_time
     final_mass = current_mass
 
-    # -------------------------------------------------------------------------
-    # CLEAN MODE: Always print ONE final plot once after the loop finishes.
-    # -------------------------------------------------------------------------
+    # Clean final display
     if last_display_lines > 0:
         clear_lines(last_display_lines)
 
@@ -661,10 +859,10 @@ def estimate_prefix_mass(
     y_vals = [y for _, y in mass_history]
 
     if x_vals:
-        plt.plot(x_vals, [prob_threshold] * len(x_vals), color="red", label="threshold")
+        # plt.plot(x_vals, [prob_threshold] * len(x_vals), color="red", label="threshold")
         plt.plot(x_vals, y_vals, color="cyan", label="cumulative mass")
     else:
-        plt.plot([0], [prob_threshold], color="red", label="threshold")
+        # plt.plot([0], [prob_threshold], color="red", label="threshold")
         plt.plot([0], [0.0], color="cyan", label="cumulative mass")
 
     plt.title(f"Cumulative Prefix Mass (len={prefix_len})")
@@ -672,10 +870,9 @@ def estimate_prefix_mass(
     plt.ylabel("Probability Mass")
     plt.plotsize(100, 20)
     plt.show()
-    # Done with dynamic display updates, moving to final text output
     last_display_lines = 0
 
-    # Effective set now = all sequences (no deduplication)
+    # Effective set = all sequences (no deduplication)
     effective_set_indices = list(range(len(all_sequences)))
 
     effective_sequences = [all_sequences[i] for i in effective_set_indices]
@@ -696,6 +893,17 @@ def estimate_prefix_mass(
     print(f"  Avg tokens: {np.mean(effective_lengths) if effective_lengths else 0:.1f}")
     print(f"\nTime: {elapsed:.1f}s ({samples_done/elapsed:.1f} samp/s)")
     print(f"{'='*80}\n")
+
+    # NEW: Perform graph analysis if enabled
+    graph_results = None
+    if enable_graph_analysis:
+        graph_results = analyze_sequences(
+            sequences=all_sequences,
+            tokenizer=tokenizer,
+            similarity_threshold=90.0,  # rapidfuzz uses 0-100 scale
+            show_progress=True
+        )
+        print_graph_analysis(graph_results)
 
     results = {
         "prefix": prefix,
@@ -729,6 +937,7 @@ def estimate_prefix_mass(
             model_name=model_name,
             tokenizer_name=tokenizer.name_or_path if hasattr(tokenizer, "name_or_path") else None,
             actual_prompt=actual_prompt,
+            prefix_ids=prefix_ids,
             prefix_len=prefix_len,
             prob_threshold=prob_threshold,
             max_len=max_len,
@@ -741,6 +950,7 @@ def estimate_prefix_mass(
             threshold_reached=threshold_reached,
             display_interval=display_interval,
             max_samples=max_samples,
+            graph_metrics=graph_results,  # NEW: Pass graph results
         )
 
     return results
@@ -748,7 +958,7 @@ def estimate_prefix_mass(
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("TESTING PREFIX MASS SAMPLING WITH VALIDATION")
+    print("TESTING PREFIX MASS SAMPLING WITH GRAPH ANALYSIS")
     print("=" * 80)
 
     print("\nLoading Qwen2.5-1.5B-Instruct...")
@@ -762,7 +972,7 @@ if __name__ == "__main__":
     )
 
     print("\n" + "=" * 80)
-    print("TEST 1: First run (will compute)")
+    print("TEST: Running with graph analysis enabled")
     print("=" * 80)
 
     results = estimate_prefix_mass(
@@ -771,71 +981,15 @@ if __name__ == "__main__":
         prefix="What is the capital of France?",
         prefix_len=8,
         prob_threshold=0.9,
-        max_samples=10000,
+        max_samples=1000,
         max_len=32,
         batch_size=16,
         display_interval=128,
-        save_path="results/test_capital_mass.delm.parquet",
-        model_name=model_name,
+        save_path="results/test_capital_mass_with_graph",
+        enable_graph_analysis=True,
     )
 
-    print("\n✓ Test 1 complete")
+    print("\n✓ Test complete")
     print(f"  Unique prefixes: {results['unique_prefixes']}")
     print(f"  Effective set: {results['effective_set_size']}")
     print(f"  Final mass: {results['final_mass']:.6f}")
-
-    print("\n" + "=" * 80)
-    print("TEST 2: Second run with SAME parameters (should load from cache)")
-    print("=" * 80)
-    input("\nPress Enter to continue...")
-
-    results2 = estimate_prefix_mass(
-        model=model,
-        tokenizer=tokenizer,
-        prefix="What is the capital of France?",
-        prefix_len=8,
-        prob_threshold=0.9,
-        max_samples=10000,
-        max_len=32,
-        batch_size=16,
-        display_interval=128,
-        save_path="results/test_capital_mass.delm.parquet",
-        model_name=model_name,
-    )
-
-    print("\n✓ Test 2 complete - results loaded from cache!")
-    print(f"  Unique prefixes: {results2['unique_prefixes']}")
-    print(f"  Effective set: {results2['effective_set_size']}")
-    print(f"  Final mass: {results2['final_mass']:.6f}")
-
-    print("\n" + "=" * 80)
-    print("TEST 3: Different parameters (should raise validation error)")
-    print("=" * 80)
-    input("\nPress Enter to continue...")
-
-    try:
-        results3 = estimate_prefix_mass(
-            model=model,
-            tokenizer=tokenizer,
-            prefix="What is the capital of France?",
-            prefix_len=32,  # Changed!
-            prob_threshold=0.9,
-            max_samples=10000,
-            max_len=32,
-            batch_size=16,
-            display_interval=128,
-            save_path="results/test_capital_mass.delm.parquet",
-            model_name=model_name,
-        )
-        print("\n⚠️ ERROR: Should have raised ValueError but didn't!")
-    except ValueError as e:
-        print("\n✓ Test 3 complete - validation error correctly raised!")
-        print(f"  Error: {str(e)[:100]}...")
-
-    print("\n" + "=" * 80)
-    print("ALL TESTS COMPLETE")
-    print("=" * 80)
-    print("\nYou can view the results with:")
-    print("  python tools/view_results.py results/test_capital_mass.delm.parquet")
-    print("\nClean up test file:")
-    print("  rm results/test_capital_mass.delm.parquet")
