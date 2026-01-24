@@ -1,7 +1,28 @@
-torch>=2.0.0
-transformers>=4.30.0
-pyarrow>=12.0.0
+# please use venv for this project
+# as we kind of need the loose dependency enforcement of venv to make this env 
+# work for the clashing dependency requirements of autoawq which requires older
+# transformers, and gptqmodel which requires newer transformers.
 numpy>=1.24.0
+pillow>=10.0.0
 plotext>=5.0.0
+pyarrow>=12.0.0
 python-Levenshtein>=0.21.0
+torch>=2.0.0
+torchvision>=0.15.0
 tqdm>=4.65.0
+# this is just for autoawq, last transformers it supports
+transformers==4.51.3
+sentencepiece>=0.1.99
+networkx>=3.0
+# for quantization
+optimum>=1.17.0
+# it is deprecated but it can still work for a while for now
+autoawq>=0.2.6
+# please install this later with pip install gptqmodel
+# it will show an error message of not the transformer they need (too old)
+# but it still runs
+# i should fix this la
+# gptqmodel>=1.0.0
+bitsandbytes>=0.43.0
+rapidfuzz>=3.6
+inflect>=7.0
