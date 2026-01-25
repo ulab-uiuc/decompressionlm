@@ -21,7 +21,7 @@ autoawq>=0.2.6
 # please install this later with pip install gptqmodel
 # it will show an error message of not the transformer they need (too old)
 # but it still runs
-# i should fix this la
+# i should fix this later
 # gptqmodel>=1.0.0
 bitsandbytes>=0.43.0
 rapidfuzz>=3.6
