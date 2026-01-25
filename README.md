@@ -23,3 +23,8 @@ sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g' exp-01.log > exp-01.clean.txt
 ```
 
 which can reduce the bloat but the color of the plot will be lost.
+
+To remove ANSI (plot will be gone) and repeated sampling stat log,
+```bash
+ed -r '/^\x1B\[/d; /^\[SAMPLING\]/,+3d' exp-02.log > exp-02.clean.txt
+```
