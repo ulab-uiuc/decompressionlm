@@ -1,0 +1,33 @@
+{
+  "metadata": {
+    "model": "Llama-3.1-8B",
+    "tokenizer": "meta-llama/Llama-3.1-8B-Instruct",
+    "prompt": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nGenerate United States bar exam legal concepts as keywords.\nPlease output ONE concept per line.\nEach concept can be multiple words if needed.\nDo not include explanations or extra text.\nPlease begin from any random concept.\nPlease use English.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+    "sampling_method": "beam_high",
+    "sampling_params": {},
+    "concept_threshold": 4096,
+    "samples_done": 0,
+    "threshold_reached": false,
+    "cutoff_index": null,
+    "elapsed_time": 1.1920928955078125e-06
+  },
+  "concept_stats": {
+    "valid_concepts_count": 0,
+    "invalid_concepts_count": 0,
+    "valid_total_occurrences": 0,
+    "invalid_total_occurrences": 0
+  },
+  "valid_concepts": [],
+  "invalid_concepts": [],
+  "profiling": {},
+  "model_memory": {
+    "model_memory_allocated_gb": 14.96546220779419,
+    "model_memory_reserved_gb": 15.234375
+  },
+  "concept_history": [
+    {
+      "sample": 0,
+      "concepts": 0
+    }
+  ]
+}

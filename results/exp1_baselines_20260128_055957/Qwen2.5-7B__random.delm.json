@@ -1,0 +1,33 @@
+{
+  "metadata": {
+    "model": "Qwen2.5-7B",
+    "tokenizer": "Qwen/Qwen2.5-7B-Instruct",
+    "prompt": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nGenerate United States bar exam legal concepts as keywords.\nPlease output ONE concept per line.\nEach concept can be multiple words if needed.\nDo not include explanations or extra text.\nPlease begin from any random concept.\nPlease use English.\n<|im_end|>\n<|im_start|>assistant\n",
+    "sampling_method": "random",
+    "sampling_params": {},
+    "concept_threshold": 4096,
+    "samples_done": 0,
+    "threshold_reached": false,
+    "cutoff_index": null,
+    "elapsed_time": 7.152557373046875e-07
+  },
+  "concept_stats": {
+    "valid_concepts_count": 0,
+    "invalid_concepts_count": 0,
+    "valid_total_occurrences": 0,
+    "invalid_total_occurrences": 0
+  },
+  "valid_concepts": [],
+  "invalid_concepts": [],
+  "profiling": {},
+  "model_memory": {
+    "model_memory_allocated_gb": 14.194102764129639,
+    "model_memory_reserved_gb": 14.33984375
+  },
+  "concept_history": [
+    {
+      "sample": 0,
+      "concepts": 0
+    }
+  ]
+}
