@@ -1,297 +1,266 @@
-# decompressionLM - Concept-Based Knowledge Extraction
+# decompressionLM - Refactored
 
-Extract and explore structured knowledge from LLMs using deterministic and exploratory sampling.
+Concept-Based Knowledge Extraction from LLMs using deterministic and exploratory sampling.
+
+## What Changed (Refactoring Summary)
+
+### 1. **Prompt Format Consistency** ✓
+- All prompts now use the same template structure
+- Prompts follow format: "Generate concepts in [domain] as keywords..."
+- Consistent instructions across all methods
+
+### 2. **Removed DFS** ✓
+- Removed `explore_dfs` function
+- Cleaned up `exploration_sampling.py`
+- Only graph exploration (BFS-style with reconnections) remains
+
+### 3. **BFS → Graph Exploration** ✓
+- Renamed from "BFS" to "GraphExplore" for accuracy
+- Now handles concept reconnections when same concept discovered via different paths
+- Tracks parent-child relationships as directed graph edges
+- Counts reconnections in stats
+- Properly represents concept relationships as graph, not just tree
+
+### 4. **Absolute Imports** ✓
+- Changed all imports from relative to absolute (e.g., `from src.concept_utils import ...`)
+- `src/__init__.py` is now empty
+- Cleaner, more explicit import structure
+
+### 5. **Experiment 4 Parameters Reduced** ✓
+- Reduced to **128 concepts** (was 4096/infinity)
+- Removed `full_gen` run (was: threshold + infinity runs)
+- Only runs single threshold-based experiment for manual verification
+- More manageable for fact-checking
+
+### 6. **Consistent Experiment Style** ✓
+- Unified formatting across all experiment files
+- Consistent function naming and structure
+- Standardized metrics extraction
+- Common CSV output format
+
+### 7. **No Dates in Folder Names** ✓
+- Removed timestamp generation logic
+- Output folders: `results/exp1_baselines`, `results/exp2_vdc_offsets`, etc.
+- No date suffixes added
+
+### 8. **Decoupled Prompts** ✓
+- Created `exp/0_prompt_templates.py`
+- All prompts now defined as lambda functions:
+  - `flat_concept_list(domain)` - for flat sampling
+  - `graph_root_prompt(domain)` - for graph exploration root
+  - `graph_child_prompt(concept, domain)` - for graph exploration children
+  - `beam_graph_prompt(domain)` - for single-sequence YAML generation
+- Experiments import and use these functions
+- Easy to tweak prompts in one centralized location
 
 ## Project Structure
 
 ```
 decompressionlm/
+├── exp/
+│   ├── 0_prompt_templates.py   # NEW: Centralized prompt definitions
+│   ├── 1_baseline.py           # Baseline comparison experiments
+│   ├── 2_offset.py             # VdC offset comparison
+│   ├── 3_quantization.py       # Quantization ladder experiments
+│   └── 4_hallucination.py      # Hallucination metrics (REDUCED)
 ├── src/
-│   ├── __init__.py              # Package exports
-│   ├── arithmetic.py            # Arithmetic sampling (UNCHANGED from original)
-│   ├── vdc.py                   # Van der Corput sequences (UNCHANGED)  
-│   ├── graph_analysis.py        # Graph analysis (UNCHANGED, optional)
-│   ├── concept_utils.py         # Concept validation & filtering
-│   ├── baseline_sampling.py     # Random & beam search baselines
-│   ├── exploration_sampling.py  # BFS/DFS hierarchical exploration
-│   ├── profiling.py            # Time & memory profiling
-│   └── concept_sampling.py      # Main flat sampling function
-├── scripts/
-│   ├── compare_methods.py       # Compare all sampling methods
-│   └── view_results.py          # Interactive result viewer
-├── examples/
-│   └── run_experiments.py       # Usage examples
-└── README.md                     # This file
+│   ├── __init__.py             # Empty (absolute imports)
+│   ├── arithmetic.py           # Arithmetic sampling (UNCHANGED)
+│   ├── vdc.py                  # Van der Corput sequences (UNCHANGED)
+│   ├── concept_utils.py        # Concept validation (UNCHANGED)
+│   ├── baseline_sampling.py    # Random & beam search (UNCHANGED)
+│   ├── profiling.py            # Time & memory profiling (UNCHANGED)
+│   ├── concept_sampling.py     # REFACTORED: Uses prompt_fn parameter
+│   └── exploration_sampling.py # REFACTORED: DFS removed, graph reconnections added
+└── README.md                   # This file
 ```
 
-## Sampling Methods
+## Key Changes in Detail
 
-### Flat Sampling (concept_sampling.py)
-All sequences share the same root prompt. Stops when N unique valid concepts discovered.
+### Prompt Templates (`exp/0_prompt_templates.py`)
 
-- **vdc**: Van der Corput deterministic sampling
-- **random**: Random sampling (seed=42 for reproducibility)
-- **beam_low**: Beam search, temp=0.5 (focused)
-- **beam_high**: Beam search, temp=1.5 (diverse)
-
-### Hierarchical Exploration (exploration_sampling.py)
-Recursively explores concept relationships by generating concepts about concepts.
-
-- **bfs**: Breadth-first search (explore all at depth D before D+1)
-- **dfs**: Depth-first search (explore one branch fully before others)
-
-Example:
-```
-ROOT: "US law and bar exam"
-├─ constitutional law (from root)
-│  ├─ first amendment (from constitutional law)
-│  │  ├─ freedom of speech (from first amendment)
-│  │  └─ freedom of religion (from first amendment)
-│  └─ due process (from constitutional law)
-└─ criminal procedure (from root)
-```
-
-## Quick Start
-
-### Flat Sampling
+All prompts now centralized as lambda functions:
 
 ```python
-from src import sample_concepts
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# Flat sampling
+flat_concept_list = lambda domain: f"""Generate concepts in {domain} as keywords.
+Please output ONE concept per line.
+Each concept can be multiple words if needed.
+Do not include explanations or extra text.
+Please begin from any random concept.
+Please use English.
+"""
 
-model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name, torch_dtype=torch.bfloat16, device_map="auto"
-)
+# Graph exploration - root
+graph_root_prompt = lambda domain: f"""Generate concepts in {domain} as keywords...
+"""
 
-# VdC sampling
-results = sample_concepts(
+# Graph exploration - children
+graph_child_prompt = lambda concept, domain: f"""Generate concepts related to {concept} in {domain} as keywords...
+"""
+```
+
+### Concept Sampling API Change
+
+**Old:**
+```python
+sample_concepts(
     model=model,
     tokenizer=tokenizer,
-    prefix="List machine learning concepts:",
-    concept_threshold=100,  # Stop at 100 unique concepts
-    sampling_method="vdc",
-    save_path="results/ml_vdc",
-)
-```
-
-### BFS Exploration
-
-```python
-from src import explore_bfs, print_tree
-
-root, concept_map, stats = explore_bfs(
-    model=model,
-    tokenizer=tokenizer,
-    domain="US law and bar exam",
-    max_concepts=100,
-    max_depth=3,
-    sequences_per_node=4,
-)
-
-# Print tree structure
-print_tree(root, max_depth=2)
-```
-
-### DFS Exploration
-
-```python
-from src import explore_dfs
-
-root_dfs, concept_map_dfs, stats_dfs = explore_dfs(
-    model=model,
-    tokenizer=tokenizer,
-    domain="machine learning",
-    max_concepts=100,
-    max_depth=3,
-)
-```
-
-## Compare All Methods
-
-```bash
-cd scripts
-python compare_methods.py \
-    --threshold 100 \
-    --max-samples 5000 \
-    --prefix "List concepts about neural networks:"
-```
-
-Output:
-```
-Method               | Samples | Valid | Invalid | Threshold | Time
------------------------------------------------------------------
-VdC                  |     523 |   101 |      45 |  REACHED  | 12.3s
-Random               |     687 |   102 |      51 |  REACHED  | 16.8s
-Beam Low             |     891 |   103 |      38 |  REACHED  | 22.1s
-Beam High            |     445 |   100 |      67 |  REACHED  | 11.2s
-```
-
-## Concept Validation Rules
-
-A concept is **valid** if:
-- Contains only ASCII letters (a-z, A-Z) and spaces
-- Length > 1 after stripping whitespace
-- Not entirely spaces
-
-Examples:
-- ✓ "machine learning"
-- ✓ "AI"
-- ✗ "ML-based" (hyphen)
-- ✗ "AI/ML" (slash)
-- ✗ "A" (too short)
-- ✗ "123" (numbers)
-
-## Output Formats
-
-### Flat Sampling: `.delm.txt`
-```
-=== METADATA ===
-model: ...
-profiling: ...
-
-=== VALID CONCEPTS (by frequency) ===
-1 | 42 | machine learning
-2 | 38 | neural network
-...
-
-=== INVALID CONCEPTS (first 64) ===
-1 | 10 | ML
-2 | 8  | #AI
-...
-```
-
-### Exploration: `.tree.txt`
-```
-=== CONCEPT TREE EXPLORATION (BFS) ===
-domain: US law
-total_concepts: 103
-max_depth: 3
-
-[ROOT] US law and bar exam
-  ├─ constitutional law (4 children)
-    ├─ first amendment (2 children)
-    ├─ due process (3 children)
-  ├─ criminal procedure (5 children)
-```
-
-## View Results
-
-```bash
-cd scripts
-python view_results.py ../results/ml_vdc.delm.txt
-```
-
-Commands:
-- `valid 20` - Show top 20 concepts
-- `search neural` - Search for concepts
-- `stats` - Show statistics
-- `profiling` - Show timing/memory
-- `q` - Quit
-
-## Key Features
-
-### Profiling
-Every run includes detailed timing and GPU memory tracking:
-- Sampling time (min/max/avg per batch)
-- Concept extraction time  
-- New concept discovery time
-- GPU memory (allocated & reserved)
-
-### Stopping Conditions
-
-**Flat sampling**: Stops at exact sequence where concept count ≥ threshold
-```
-Threshold: 100
-Seq 523: 99 concepts
-Seq 524: 101 concepts  ← STOP HERE
-Seq 525+: DISCARDED
-```
-
-**BFS/DFS**: Stops when total unique concepts ≥ threshold across all depths
-
-### Deduplication
-
-Concepts are normalized before deduplication:
-1. Strip leading/trailing spaces
-2. Collapse internal whitespace
-3. Lowercase
-
-"Machine Learning" = "machine  learning" = "MACHINE LEARNING"
-
-## Advanced Usage
-
-### Custom Prompting for Exploration
-
-```python
-# Default: "List concepts related to X in Y:"
-# Customize by modifying exploration_sampling.py:generate_concepts_for_node()
-
-# For more structured output:
-prompt = f"""Generate concepts related to {node.concept} in {domain}.
-Output one concept per line.
-Be specific and use full terms."""
-```
-
-### Combining Methods
-
-```python
-# 1. BFS to discover broad structure
-root_bfs, _, stats_bfs = explore_bfs(
-    model, tokenizer, "neural networks",
-    max_concepts=50, max_depth=2
-)
-
-# 2. DFS on interesting branches
-for child in root_bfs.children:
-    if child.concept == "transformers":
-        root_dfs, _, _ = explore_dfs(
-            model, tokenizer, f"{child.concept} in neural networks",
-            max_concepts=100, max_depth=4
-        )
-```
-
-### Profiling Analysis
-
-```python
-results = sample_concepts(..., display_interval=128)
-
-# Check timing breakdown
-prof = results['profiling']
-print(f"Sampling: {prof['time_sampling_total']:.2f}s")
-print(f"Extraction: {prof['time_concept_extraction_total']:.2f}s")
-
-# Check GPU memory
-print(f"Peak GPU: {prof['gpu_sampling_end_allocated_max']:.2f} GB")
-```
-
-## Backward Compatibility
-
-Old code still works! Your original `bin_entropy.py` is unchanged:
-
-```python
-# Old code continues to work
-from src.bin_entropy import estimate_prefix_mass
-
-results = estimate_prefix_mass(
-    model=model,
-    tokenizer=tokenizer,
-    prefix_len=8,
-    prob_threshold=0.9,
+    prefix="List concepts about...",  # Raw string
     ...
 )
 ```
 
-## What Changed
+**New:**
+```python
+sample_concepts(
+    model=model,
+    tokenizer=tokenizer,
+    prompt_fn=lambda: flat_concept_list(domain),  # Function returning string
+    ...
+)
+```
 
-1. **No probability tracking** - Just count concepts, no prefix probability mass
-2. **Concept-based stopping** - Stop at N concepts, not probability threshold
-3. **Multiple sampling methods** - VdC, random, beam (low/high), BFS, DFS
-4. **Hierarchical exploration** - NEW: BFS/DFS for concept trees
-5. **Better validation** - Strict ASCII alphabetic filtering
-6. **Comprehensive profiling** - Time & memory tracking per stage
-7. **Human-readable output** - Text files instead of binary parquet
+### Graph Exploration API Change
+
+**Old:**
+```python
+explore_bfs(
+    model=model,
+    tokenizer=tokenizer,
+    domain="US law",
+    ...
+)
+```
+
+**New:**
+```python
+explore_graph(
+    model=model,
+    tokenizer=tokenizer,
+    domain="US law",
+    root_prompt_fn=graph_root_prompt,
+    child_prompt_fn=graph_child_prompt,
+    ...
+)
+```
+
+Key improvements:
+- Renamed from `explore_bfs` to `explore_graph` (more accurate)
+- Accepts prompt functions as parameters
+- Handles reconnections when concepts rediscovered
+- Tracks parent-child relationships as directed edges
+- Returns graph stats including reconnection count
+
+## Experiment Changes
+
+### Experiment 1: Baseline Comparison
+- ✓ Uses prompt templates
+- ✓ "BFS" renamed to "GraphExplore"
+- ✓ Consistent formatting
+- ✓ No date in output folder
+
+### Experiment 2: VdC Offset Comparison
+- ✓ Uses prompt templates
+- ✓ Consistent formatting
+- ✓ No date in output folder
+
+### Experiment 3: Quantization Ladder
+- ✓ Uses prompt templates
+- ✓ Consistent formatting
+- ✓ No date in output folder
+
+### Experiment 4: Hallucination Metrics
+- ✓ Reduced to **128 concepts** (was 4096)
+- ✓ Removed `full_gen` run
+- ✓ Only threshold-based experiment
+- ✓ Designed for manual fact-checking
+- ✓ Uses prompt templates
+- ✓ Consistent formatting
+- ✓ No date in output folder
+
+## Graph Exploration Details
+
+The refactored graph exploration properly handles concept relationships:
+
+1. **Graph Structure**: Concepts form a directed graph where edges represent "related to" relationships
+2. **Reconnections**: When a concept is discovered that already exists, we create an edge from the discovering node to the existing node
+3. **Multiple Parents**: Nodes can have multiple parents if discovered through different paths
+4. **Stats Tracking**: Includes `reconnections` count in stats
+
+Example:
+```
+ROOT: US law
+  ├─ constitutional law
+  │   ├─ first amendment
+  │   └─ due process (parents: 2)  ← discovered by both constitutional law AND criminal procedure
+  └─ criminal procedure
+      └─ due process (reconnection!)
+```
+
+## Running Experiments
+
+### Experiment 1: Baseline Comparison
+```bash
+cd exp
+python 1_baseline.py
+```
+
+### Experiment 4: Hallucination Metrics (Reduced)
+```bash
+cd exp
+python 4_hallucination.py
+```
+
+Results saved to `results/exp4_hallucination/` with 128 concepts for manual verification.
+
+## Migration Guide
+
+### If you have existing code using the old API:
+
+**Concept Sampling:**
+```python
+# Old
+from src import sample_concepts
+results = sample_concepts(model, tokenizer, prefix="List concepts...")
+
+# New
+from exp.prompt_templates import flat_concept_list
+from src.concept_sampling import sample_concepts
+results = sample_concepts(model, tokenizer, prompt_fn=lambda: flat_concept_list("domain"))
+```
+
+**Graph Exploration:**
+```python
+# Old
+from src import explore_bfs
+root, map, stats = explore_bfs(model, tokenizer, "domain", ...)
+
+# New
+from exp.prompt_templates import graph_root_prompt, graph_child_prompt
+from src.exploration_sampling import explore_graph
+root, map, stats = explore_graph(
+    model, tokenizer, "domain",
+    root_prompt_fn=graph_root_prompt,
+    child_prompt_fn=graph_child_prompt,
+    ...
+)
+```
+
+## Benefits of Refactoring
+
+1. **Cleaner prompt management**: All prompts in one place, easy to tweak
+2. **More accurate naming**: "GraphExplore" instead of "BFS" properly describes the algorithm
+3. **Better graph representation**: Handles reconnections and multiple parents correctly
+4. **Consistent style**: All experiments follow same patterns
+5. **Reduced manual work**: Exp 4 now only 128 concepts for feasible fact-checking
+6. **Absolute imports**: More explicit and maintainable
+7. **No timestamp clutter**: Clean folder names for persistent results
+
+## Backward Compatibility
+
+The core algorithms (`arithmetic.py`, `vdc.py`, `concept_utils.py`, `baseline_sampling.py`, `profiling.py`) remain **unchanged**. Only the high-level API and experiment organization changed.
 
 ## Citation
 

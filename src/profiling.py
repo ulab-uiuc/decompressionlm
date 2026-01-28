@@ -11,9 +11,9 @@ class ProfileStats:
     """Track timing and memory statistics."""
     
     def __init__(self):
-        self.timings = defaultdict(list)  # stage -> list of durations
-        self.gpu_memory = defaultdict(list)  # stage -> list of (allocated, reserved) tuples
-        self.counters = defaultdict(int)  # stage -> count
+        self.timings = defaultdict(list)
+        self.gpu_memory = defaultdict(list)
+        self.counters = defaultdict(int)
         
     def record_time(self, stage: str, duration: float):
         """Record a timing measurement."""
@@ -23,8 +23,8 @@ class ProfileStats:
     def record_gpu_memory(self, stage: str):
         """Record current GPU memory usage."""
         if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-            reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
             self.gpu_memory[stage].append((allocated, reserved))
     
     def get_summary(self) -> Dict:
@@ -130,43 +130,10 @@ def measure_model_memory():
     if not torch.cuda.is_available():
         return {}
     
-    # Get current memory state
-    allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-    reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
     
     return {
         "model_memory_allocated_gb": allocated,
         "model_memory_reserved_gb": reserved,
     }
-
-
-if __name__ == "__main__":
-    # Test profiling
-    print("Testing profiling utilities...")
-    
-    stats = ProfileStats()
-    
-    # Simulate some work
-    print("\nSimulating work stages...")
-    
-    with profile_section(stats, "stage1"):
-        time.sleep(0.1)
-    
-    with profile_section(stats, "stage2"):
-        time.sleep(0.05)
-    
-    with profile_section(stats, "stage1"):
-        time.sleep(0.15)
-    
-    # Print results
-    stats.print_summary()
-    
-    # Test format_time
-    print("Time formatting tests:")
-    print(f"  0.0005s -> {format_time(0.0005)}")
-    print(f"  0.5s -> {format_time(0.5)}")
-    print(f"  5s -> {format_time(5)}")
-    print(f"  65s -> {format_time(65)}")
-    print(f"  125.5s -> {format_time(125.5)}")
-    
-    print("\n✓ Profiling utilities working!")

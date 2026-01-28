@@ -1,2 +1,0 @@
-model,method,samples,valid_concepts,invalid_concepts,invalid_ratio,threshold_reached,tokens_per_sec,concepts_per_sec,total_time,time_to_converge,total_tokens,avg_tokens_per_seq,gpu_allocated_max,max_depth,nodes_explored
-Llama-3.1-8B,BFS,4,0,0,N/A,False,119.64,0.0000,1.07,1.07,128,32.00,N/A,0,1
