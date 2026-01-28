@@ -1,402 +1,307 @@
 #!/usr/bin/env python3
 """
-Experiment 1: Baseline Comparison
+Experiment 1: Baseline Comparison (UNIFIED)
 
-Compare different sampling methods on US law domain.
+Compare 5 sampling methods across 4 domains and 2 models.
 
-Models: Llama-3.1-8B, Qwen2.5-7B
-Domain: US law & Bar Exam
 Methods:
-  1: Beam search + sample 1 seq which is YAML graph
-  2: BFS (hierarchical graph exploration)
-  3: deLM + beam high temp
-  4: deLM + beam low temp
-  5: deLM + uniform random sample
+  1. deLM+VdC: Flat sampling with Van der Corput (offset=0)
+  2. deLM+Random: Flat sampling with random sampling  
+  3. GraphExplore+BeamHigh: Hierarchical graph with beam search (temp=1.5)
+  4. GraphExplore+BeamLow: Hierarchical graph with beam search (temp=0.5)
+  5. GraphExplore+Greedy: Hierarchical graph with greedy sampling
+
+Domains: US law, Git, Radiology, FAA
+Models: Llama-3.1-8B, Qwen2.5-7B
+Threshold: 1024 concepts
+Seed: 42
 """
 
 import os
 import sys
 import time
-import csv
+import numpy as np
 import torch
 from pathlib import Path
-from datetime import datetime
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src import sample_concepts, explore_bfs
-from src.profiling import measure_model_memory
+from exp.prompt_templates import graph_root_prompt, graph_child_prompt, flat_concept_list
+from src.concept_sampling import sample_concepts
+from src.exploration_sampling import explore_graph
+
+# Import unified utilities
+sys.path.insert(0, str(Path(__file__).parent))
+from exp_common_utils import (
+    load_model_with_profiling,
+    create_unified_json_schema,
+    save_unified_json,
+    load_unified_json,
+    extract_metrics_from_json,
+    extract_metrics_from_fresh_results,
+    save_metrics_to_csv,
+    print_metrics_table,
+)
 
 
+# ============================================================================
 # Configuration
+# ============================================================================
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
 MODELS = {
     "Llama-3.1-8B": "meta-llama/Llama-3.1-8B-Instruct",
     "Qwen2.5-7B": "Qwen/Qwen2.5-7B-Instruct",
 }
 
-DOMAIN = "US law and bar exam"
+DOMAINS = {
+    "us_law": "US law and bar exam",
+    "git": "Git version control",
+    "radiology": "Radiology and medical imaging",
+    "faa": "FAA regulations and aviation",
+}
 
-# Method configurations
+CONCEPT_THRESHOLD = 1024
+MAX_LEN = 32
+BATCH_SIZE = 64
+
 METHODS = {
-    "beam_graph": {
-        "name": "Beam+Graph",
-        "type": "graph_gen",  # Special: generates graph in single sequence
-        "sampling_method": "beam_low",
-    },
-    "bfs": {
-        "name": "BFS",
-        "type": "exploration",
-        "max_depth": 3,
-        "sequences_per_node": 4,
-    },
-    "delm_beam_high": {
-        "name": "deLM+BeamHigh",
+    "delm_vdc": {
+        "name": "deLM+VdC",
         "type": "flat",
-        "sampling_method": "beam_high",
-    },
-    "delm_beam_low": {
-        "name": "deLM+BeamLow",
-        "type": "flat",
-        "sampling_method": "beam_low",
+        "sampling_method": "vdc",
     },
     "delm_random": {
         "name": "deLM+Random",
         "type": "flat",
         "sampling_method": "random",
     },
+    "graph_greedy": {
+        "name": "GraphExplore+Greedy",
+        "type": "exploration",
+        "max_depth": 64,
+        "sequences_per_node": 4,
+        "sampling_method": "greedy",
+        "node_parallel_batch_size": BATCH_SIZE,
+    },
+    "graph_beam_high": {
+        "name": "GraphExplore+BeamHigh",
+        "type": "exploration",
+        "max_depth": 64,
+        "sequences_per_node": 4,
+        "sampling_method": "beam_high",
+        "node_parallel_batch_size": BATCH_SIZE,
+    },
+    "graph_beam_low": {
+        "name": "GraphExplore+BeamLow",
+        "type": "exploration",
+        "max_depth": 64,
+        "sequences_per_node": 4,
+        "sampling_method": "beam_low",
+        "node_parallel_batch_size": BATCH_SIZE,
+    },
 }
 
-# Shared params
-CONCEPT_THRESHOLD = 4096
-MAX_SEQ_COUNT = 0
-MAX_LEN = 32
-BATCH_SIZE = 16
 
+# ============================================================================
+# Experiment Runners
+# ============================================================================
 
-def load_model_with_timing(model_name: str):
-    """Load model and return (model, tokenizer, load_time)."""
+def run_graph_exploration(
+    model, tokenizer, model_short: str, domain_key: str, domain_prompt: str,
+    method_config: dict, gpu_profiling: dict, save_dir: str
+) -> dict:
+    """Run graph exploration method."""
+    
+    method_name = method_config['name']
+    sampling_method = method_config['sampling_method']
+    
+    # Create save path
+    save_name = f"{model_short}__{domain_key}__graph_{sampling_method}"
+    save_path = os.path.join(save_dir, save_name)
+    json_path = save_path + ".delm.json"
+    
+    # Check if already exists
+    if os.path.exists(json_path):
+        print(f"✓ Result exists: {os.path.basename(json_path)}")
+        data = load_unified_json(json_path)
+        return extract_metrics_from_json(data, model_short, method_name, domain_key, CONCEPT_THRESHOLD)
+    
+    # Run new exploration
     print(f"\n{'='*80}")
-    print(f"Loading {model_name}...")
+    print(f"Method: {method_name} | Domain: {domain_key}")
     print(f"{'='*80}")
     
     start = time.time()
     
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-    )
-    
-    load_time = time.time() - start
-    model_mem = measure_model_memory()
-    
-    print(f"✓ Loaded in {load_time:.2f}s")
-    print(f"✓ GPU memory: {model_mem.get('model_memory_allocated_gb', 0):.2f} GB")
-    
-    return model, tokenizer, load_time, model_mem
-
-
-def run_graph_generation(model, tokenizer, model_name: str, save_dir: str):
-    """
-    Method 2.1: Beam search + generate graph in YAML format (single sequence).
-    """
-    
-    prefix = """Generate United States bar exam legal concepts as keywords.
-Please output ONE concept per line.
-Each concept can be multiple words if needed.
-Do not include explanations or extra text.
-Please begin from any random concept.
-Please use English.
-"""
-    
-    save_path = os.path.join(save_dir, f"{model_name}__beam_graph")
-    
-    print(f"\n{'='*80}")
-    print(f"Method: Beam+Graph (single YAML sequence)")
-    print(f"{'='*80}")
-    
-    start = time.time()
-    
-    # Generate single long sequence with beam search
-    messages = [{"role": "user", "content": prefix}]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    prefix_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-    
-    outputs = model.generate(
-        prefix_ids,
-        max_new_tokens=512,  # Longer for full graph
-        num_beams=4,
-        temperature=0.7,
-        do_sample=False,
-    )
-    
-    elapsed = time.time() - start
-    
-    # Decode
-    generated_ids = outputs[0][prefix_ids.shape[1]:]
-    text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    
-    # Parse YAML to extract concepts
-    # Simple extraction: lines starting with "- concept:"
-    import re
-    concepts = re.findall(r'-\s*concept:\s*([^\n]+)', text)
-    concepts = [c.strip() for c in concepts]
-    
-    # Save
-    save_file = f"{save_path}.yaml"
-    with open(save_file, 'w') as f:
-        f.write(text)
-    
-    print(f"✓ Generated graph with {len(concepts)} concepts in {elapsed:.2f}s")
-    print(f"✓ Saved to {save_file}")
-    
-    metrics = {
-        'model': model_name,
-        'method': 'Beam+Graph',
-        'samples': 1,
-        'valid_concepts': len(concepts),
-        'invalid_concepts': 0,
-        'invalid_ratio': "0.0000",
-        'threshold_reached': len(concepts) >= CONCEPT_THRESHOLD,
-        'tokens_per_sec': f"{len(generated_ids) / elapsed:.2f}",
-        'concepts_per_sec': f"{len(concepts) / elapsed:.4f}",
-        'total_time': f"{elapsed:.2f}",
-        'time_to_converge': f"{elapsed:.2f}",
-        'total_tokens': len(generated_ids),
-        'avg_tokens_per_seq': f"{len(generated_ids):.2f}",
-        'gpu_allocated_max': "N/A",
-    }
-    
-    return metrics
-
-
-def run_bfs_exploration(model, tokenizer, model_name: str, method_config: dict, save_dir: str):
-    """Method 2.2: BFS hierarchical exploration."""
-    
-    save_path = os.path.join(save_dir, f"{model_name}__bfs")
-    
-    print(f"\n{'='*80}")
-    print(f"Method: BFS (hierarchical exploration)")
-    print(f"{'='*80}")
-    
-    start = time.time()
-    
-    root, concept_map, stats = explore_bfs(
+    root, concept_map, graph_stats = explore_graph(
         model=model,
         tokenizer=tokenizer,
-        domain=DOMAIN,
+        domain=domain_prompt,
+        root_prompt_fn=graph_root_prompt,
+        child_prompt_fn=graph_child_prompt,
         max_concepts=CONCEPT_THRESHOLD,
         max_depth=method_config['max_depth'],
         sequences_per_node=method_config['sequences_per_node'],
         max_len=MAX_LEN,
-        sampling_method="vdc",
+        sampling_method=sampling_method,
+        node_parallel_batch_size=method_config.get("node_parallel_batch_size", 1),
     )
     
     elapsed = time.time() - start
     
-    # Extract metrics
-    total_tokens = stats['total_sequences_generated'] * MAX_LEN  # Approximate
+    # Create unified JSON schema
+    schema = create_unified_json_schema(
+        model_name=model_short,
+        method_name=method_name,
+        method_type='exploration',
+        domain_key=domain_key,
+        domain_prompt=domain_prompt,
+        threshold=CONCEPT_THRESHOLD,
+        sampling_method=sampling_method,
+        elapsed_time=elapsed,
+        samples_done=graph_stats['total_sequences_generated'],
+        valid_concepts_count=graph_stats['concepts_discovered'],
+        invalid_concepts_count=0,
+        threshold_reached=graph_stats['concepts_discovered'] >= CONCEPT_THRESHOLD,
+        sequences=[],  # Not stored for graph methods
+        valid_concepts=[],  # Concept list stored separately
+        invalid_concepts=[],
+        gpu_profiling=gpu_profiling,
+        method_config=method_config,
+        graph_stats=graph_stats,
+        concept_list=list(concept_map.keys()),
+    )
     
-    metrics = {
-        'model': model_name,
-        'method': 'BFS',
-        'samples': stats['total_sequences_generated'],
-        'valid_concepts': stats['concepts_discovered'],
-        'invalid_concepts': 0,  # BFS doesn't track invalid separately yet
-        'invalid_ratio': "N/A",
-        'threshold_reached': stats['concepts_discovered'] >= CONCEPT_THRESHOLD,
-        'tokens_per_sec': f"{total_tokens / elapsed:.2f}",
-        'concepts_per_sec': f"{stats['concepts_discovered'] / elapsed:.4f}",
-        'total_time': f"{elapsed:.2f}",
-        'time_to_converge': f"{elapsed:.2f}",
-        'total_tokens': total_tokens,
-        'avg_tokens_per_seq': f"{MAX_LEN:.2f}",
-        'gpu_allocated_max': "N/A",
-        'max_depth': stats['max_depth_reached'],
-        'nodes_explored': stats['total_nodes_explored'],
-    }
+    save_unified_json(save_path, schema)
     
-    return metrics
+    return extract_metrics_from_json(schema, model_short, method_name, domain_key, CONCEPT_THRESHOLD)
 
 
-def run_flat_sampling(model, tokenizer, model_name: str, method_config: dict, save_dir: str):
-    """Methods 2.3-2.5: Flat sampling with different methods."""
+def run_flat_sampling(
+    model, tokenizer, model_short: str, domain_key: str, domain_prompt: str,
+    method_config: dict, gpu_profiling: dict, save_dir: str
+) -> dict:
+    """Run flat sampling method."""
     
     sampling_method = method_config['sampling_method']
     method_name = method_config['name']
     
-    prefix = """Generate United States bar exam legal concepts as keywords.
-Please output ONE concept per line.
-Each concept can be multiple words if needed.
-Do not include explanations or extra text.
-Please begin from any random concept.
-Please use English.
-"""
+    # Create save path
+    save_name = f"{model_short}__{domain_key}__{sampling_method}"
+    save_path = os.path.join(save_dir, save_name)
+    json_path = save_path + ".delm.json"
     
-    save_path = os.path.join(save_dir, f"{model_name}__{sampling_method}")
+    # Check if exists
+    if os.path.exists(json_path):
+        print(f"✓ Result exists: {os.path.basename(json_path)}")
+        data = load_unified_json(json_path)
+        return extract_metrics_from_json(data, model_short, method_name, domain_key, CONCEPT_THRESHOLD)
     
+    # Run sampling
     print(f"\n{'='*80}")
-    print(f"Method: {method_name}")
+    print(f"Method: {method_name} | Domain: {domain_key}")
     print(f"{'='*80}")
+    
+    sampling_params = {}
+    if sampling_method == "vdc":
+        sampling_params['offset'] = 0.0
     
     results = sample_concepts(
         model=model,
         tokenizer=tokenizer,
-        prefix=prefix,
+        prompt_fn=lambda: flat_concept_list(domain_prompt),
         concept_threshold=CONCEPT_THRESHOLD,
-        max_samples=MAX_SEQ_COUNT,
+        max_samples=100000,
         max_len=MAX_LEN,
         batch_size=BATCH_SIZE,
         sampling_method=sampling_method,
+        sampling_params=sampling_params,
         save_path=save_path,
-        model_name=model_name,
+        model_name=model_short,
     )
     
-    # Extract metrics
-    metrics = extract_metrics(results, model_name, method_name)
-    
-    return metrics
+    return extract_metrics_from_fresh_results(
+        results, model_short, method_name, domain_key, CONCEPT_THRESHOLD, gpu_profiling
+    )
 
 
-def extract_metrics(results: dict, model_name: str, method_name: str) -> dict:
-    """Extract metrics from flat sampling results."""
-    
-    prof = results.get('profiling', {})
-    elapsed = results['elapsed_time']
-    samples_done = results['samples_done']
-    
-    tokens_total = sum(len(seq['tokens']) for seq in results['sequences'])
-    tokens_per_sec = tokens_total / elapsed if elapsed > 0 else 0
-    concepts_per_sec = results['valid_concepts'] / elapsed if elapsed > 0 else 0
-    
-    total_raw = results['valid_concepts'] + results['invalid_concepts']
-    invalid_ratio = results['invalid_concepts'] / total_raw if total_raw > 0 else 0
-    
-    return {
-        'model': model_name,
-        'method': method_name,
-        'samples': samples_done,
-        'valid_concepts': results['valid_concepts'],
-        'invalid_concepts': results['invalid_concepts'],
-        'invalid_ratio': f"{invalid_ratio:.4f}",
-        'threshold_reached': results['threshold_reached'],
-        'tokens_per_sec': f"{tokens_per_sec:.2f}",
-        'concepts_per_sec': f"{concepts_per_sec:.4f}",
-        'total_time': f"{elapsed:.2f}",
-        'time_to_converge': f"{elapsed:.2f}" if results['threshold_reached'] else "N/A",
-        'total_tokens': tokens_total,
-        'avg_tokens_per_seq': f"{tokens_total / samples_done if samples_done > 0 else 0:.2f}",
-        'sampling_time_avg': f"{prof.get('time_sampling_avg', 0):.4f}",
-        'extraction_time_avg': f"{prof.get('time_concept_extraction_avg', 0):.4f}",
-        'gpu_allocated_avg': f"{prof.get('gpu_sampling_end_allocated_avg', 0):.2f}",
-        'gpu_allocated_max': f"{prof.get('gpu_sampling_end_allocated_max', 0):.2f}",
-    }
-
-
-def print_metrics_table(all_metrics: list):
-    """Print formatted comparison table."""
-    
-    print(f"\n{'='*120}")
-    print("EXPERIMENT 2: BASELINE COMPARISON - RESULTS")
-    print(f"Domain: {DOMAIN}")
-    print(f"{'='*120}\n")
-    
-    # Header
-    print(f"{'Model':<15} | {'Method':<15} | {'Samples':>7} | {'Valid':>6} | {'Invalid':>7} | "
-          f"{'Ratio':>6} | {'Conv':>5} | {'Time':>7} | {'Tok/s':>8} | {'Con/s':>8}")
-    print("-" * 120)
-    
-    # Rows
-    for m in all_metrics:
-        converged = "YES" if m['threshold_reached'] else "NO"
-        print(f"{m['model']:<15} | {m['method']:<15} | {m['samples']:>7} | "
-              f"{m['valid_concepts']:>6} | {m['invalid_concepts']:>7} | "
-              f"{m['invalid_ratio']:>6} | {converged:>5} | "
-              f"{m['total_time']:>7}s | {m['tokens_per_sec']:>8} | {m['concepts_per_sec']:>8}")
-    
-    print(f"\n{'='*120}\n")
-
-
-def save_to_csv(all_metrics: list, output_path: str):
-    """Save metrics to CSV."""
-    
-    if not all_metrics:
-        return
-    
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    
-    fieldnames = list(all_metrics[0].keys())
-    
-    with open(output_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(all_metrics)
-    
-    print(f"✓ Saved CSV to {output_path}")
-
+# ============================================================================
+# Main
+# ============================================================================
 
 def main():
-    """Run experiment 1."""
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = f"results/exp1_baselines_{timestamp}"
+    save_dir = "results/exp1_baselines"
     csv_path = f"{save_dir}/metrics.csv"
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
     
     print(f"{'='*80}")
-    print("EXPERIMENT 1: BASELINE COMPARISON")
+    print("EXPERIMENT 1: BASELINE COMPARISON (UNIFIED)")
     print(f"{'='*80}")
+    print(f"Seed: {SEED}")
     print(f"Models: {list(MODELS.keys())}")
-    print(f"Domain: {DOMAIN}")
+    print(f"Domains: {list(DOMAINS.keys())}")
     print(f"Methods: {[m['name'] for m in METHODS.values()]}")
-    print(f"Save directory: {save_dir}")
+    print(f"Concept threshold: {CONCEPT_THRESHOLD}")
+    print(f"Total experiments: {len(MODELS) * len(DOMAINS) * len(METHODS)}")
     print(f"{'='*80}\n")
     
     all_metrics = []
     
     for model_short, model_path in MODELS.items():
+        # Load model with profiling (setup padding for graph methods)
+        model, tokenizer, gpu_profiling = load_model_with_profiling(
+            model_path, model_short, setup_padding=True
+        )
         
-        # Load model once
-        model, tokenizer, load_time, model_mem = load_model_with_timing(model_path)
-        
-        for method_key, method_config in METHODS.items():
+        for domain_key, domain_prompt in DOMAINS.items():
+            print(f"\n{'#'*80}")
+            print(f"# {model_short} | {domain_key}")
+            print(f"{'#'*80}")
             
-            try:
-                method_type = method_config['type']
-                
-                if method_type == 'graph_gen':
-                    metrics = run_graph_generation(model, tokenizer, model_short, save_dir)
-                elif method_type == 'exploration':
-                    metrics = run_bfs_exploration(model, tokenizer, model_short, method_config, save_dir)
-                elif method_type == 'flat':
-                    metrics = run_flat_sampling(model, tokenizer, model_short, method_config, save_dir)
-                else:
-                    raise ValueError(f"Unknown method type: {method_type}")
-                
-                all_metrics.append(metrics)
-                
-                print(f"\n✓ Completed: {model_short}/{method_config['name']}")
-                print(f"  Samples: {metrics['samples']}, Valid: {metrics['valid_concepts']}, Time: {metrics['total_time']}s")
-                
-            except Exception as e:
-                print(f"\n✗ Failed: {model_short}/{method_config['name']}")
-                print(f"  Error: {e}")
-                import traceback
-                traceback.print_exc()
+            for method_key, method_config in METHODS.items():
+                try:
+                    method_type = method_config['type']
+                    
+                    if method_type == 'exploration':
+                        metrics = run_graph_exploration(
+                            model, tokenizer, model_short, domain_key, domain_prompt,
+                            method_config, gpu_profiling, save_dir
+                        )
+                    elif method_type == 'flat':
+                        metrics = run_flat_sampling(
+                            model, tokenizer, model_short, domain_key, domain_prompt,
+                            method_config, gpu_profiling, save_dir
+                        )
+                    else:
+                        raise ValueError(f"Unknown type: {method_type}")
+                    
+                    all_metrics.append(metrics)
+                    
+                    print(f"\n✓ Completed: {model_short}/{domain_key}/{method_config['name']}")
+                    print(f"  Samples: {metrics['samples']}, Valid: {metrics['valid_concepts']}, "
+                          f"Time: {metrics['total_time']}s")
+                    
+                except Exception as e:
+                    print(f"\n✗ Failed: {model_short}/{domain_key}/{method_config['name']}")
+                    print(f"  Error: {e}")
+                    import traceback
+                    traceback.print_exc()
         
-        # Clean up
         del model
         torch.cuda.empty_cache()
     
-    # Print final table
-    print_metrics_table(all_metrics)
-    
-    # Save CSV
-    save_to_csv(all_metrics, csv_path)
+    # Print and save results
+    print_metrics_table(all_metrics, "EXPERIMENT 1: BASELINE COMPARISON - RESULTS", show_gpu=True)
+    save_metrics_to_csv(all_metrics, csv_path)
     
     print(f"\n✓ Experiment 1 complete!")
-    print(f"✓ Results saved to {save_dir}/")
+    print(f"✓ Results: {save_dir}/")
+    print(f"✓ CSV: {csv_path}")
+    print(f"✓ Total experiments: {len(all_metrics)}")
 
 
 if __name__ == "__main__":
