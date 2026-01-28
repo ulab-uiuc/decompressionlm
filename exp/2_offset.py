@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Experiment 2: VdC Offset Comparison (New Codebase)
+Experiment 2: VdC Offset Comparison
 
 Test VdC sampling with different offsets to measure:
 1. Concept overlap between 8 random offsets
@@ -20,12 +20,12 @@ import random
 import torch
 import numpy as np
 from pathlib import Path
-from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src import sample_concepts
+from exp.prompt_templates import flat_concept_list
+from src.concept_sampling import sample_concepts
 from src.profiling import measure_model_memory
 
 
@@ -40,11 +40,12 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-# Models to test
 MODELS = {
     "Llama-3.1-8B": "meta-llama/Llama-3.1-8B-Instruct",
     "Qwen2.5-7B": "Qwen/Qwen2.5-7B-Instruct",
 }
+
+DOMAIN = "US law and bar exam"
 
 # Experiment parameters
 CONCEPT_THRESHOLD = 1024
@@ -53,16 +54,7 @@ MAX_LEN = 32
 BATCH_SIZE = 16
 NUM_OFFSET_RUNS = 8  # Number of random offsets to test
 
-# Prompt
-PROMPT = """Generate United States bar exam legal concepts as keywords.
-Please output ONE concept per line.
-Each concept can be multiple words if needed.
-Do not include explanations or extra text.
-Please begin from any random concept.
-Please use English.
-"""
-
-# Output directories (NO DATE in path for persistence)
+# Output directories (NO DATE)
 OUTPUT_DIR = "results/exp2_vdc_offsets"
 VDC_OFFSETS_BINARY = os.path.join(OUTPUT_DIR, "vdc_offsets.bin")
 VDC_OFFSETS_META = os.path.join(OUTPUT_DIR, "vdc_offsets_meta.json")
@@ -79,7 +71,6 @@ def generate_vdc_offsets_binary(num_offsets, seed=42):
     random.seed(seed)
     np.random.seed(seed)
     
-    # Generate offsets as numpy float64
     # Include offset=0 as first, then random offsets
     offsets_np = np.zeros(num_offsets + 1, dtype=np.float64)
     offsets_np[0] = 0.0  # Baseline
@@ -119,7 +110,7 @@ def generate_vdc_offsets_binary(num_offsets, seed=42):
         "description": "VdC offsets for offset comparison experiment",
         "numpy_dtype": str(offsets_np.dtype),
         "binary_file": VDC_OFFSETS_BINARY,
-        "created_at": datetime.now().isoformat(),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     
     with open(VDC_OFFSETS_META, 'w') as f:
@@ -246,7 +237,7 @@ def run_vdc_offset_experiment(
     results = sample_concepts(
         model=model,
         tokenizer=tokenizer,
-        prefix=PROMPT,
+        prompt_fn=lambda: flat_concept_list(DOMAIN),
         concept_threshold=CONCEPT_THRESHOLD,
         max_samples=MAX_SEQ_COUNT,
         max_len=MAX_LEN,
@@ -411,18 +402,15 @@ def analyze_efficiency_ranking(all_results, model_short):
     print("| ---- | ------ | --------- | ------: | -------: | ---------------: |")
     
     baseline_samples = None
-    baseline_offset = None
     
     for rank, result in enumerate(sorted_by_samples, 1):
         offset_idx = result['offset_idx']
-        label = "BASELINE" if offset_idx == 0 else f"Random {offset_idx}"
         
         # Calculate efficiency score (concepts per sample)
         efficiency = result['valid_concepts'] / result['samples'] if result['samples'] > 0 else 0
         
         if offset_idx == 0:
             baseline_samples = result['samples']
-            baseline_offset = result['offset']
         
         marker = " ★" if offset_idx == 0 else ""
         print(f"| {rank:4d} | {offset_idx:6d} | {result['offset']:9.6f} | {result['samples']:7d} | "
@@ -466,7 +454,7 @@ def print_metrics_table(all_metrics):
     """Print combined metrics table for all models."""
     
     print(f"\n{'='*120}")
-    print("EXPERIMENT 4: VDC OFFSET COMPARISON - COMBINED RESULTS")
+    print("EXPERIMENT 2: VDC OFFSET COMPARISON - COMBINED RESULTS")
     print(f"{'='*120}\n")
     
     print(f"{'Model':<15} | {'Offset':>6} | {'VdC':>9} | {'Samples':>7} | {'Valid':>6} | "

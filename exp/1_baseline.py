@@ -7,8 +7,8 @@ Compare different sampling methods on US law domain.
 Models: Llama-3.1-8B, Qwen2.5-7B
 Domain: US law & Bar Exam
 Methods:
-  1: Beam search + sample 1 seq which is YAML graph
-  2: BFS (hierarchical graph exploration)
+  1: Beam search + single YAML graph
+  2: Graph exploration (BFS-style with reconnections)
   3: deLM + beam high temp
   4: deLM + beam low temp
   5: deLM + uniform random sample
@@ -20,16 +20,20 @@ import time
 import csv
 import torch
 from pathlib import Path
-from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src import sample_concepts, explore_bfs
+from exp.prompt_templates import beam_graph_prompt, graph_root_prompt, graph_child_prompt, flat_concept_list
+from src.concept_sampling import sample_concepts
+from src.exploration_sampling import explore_graph
 from src.profiling import measure_model_memory
 
 
+# ============================================================================
 # Configuration
+# ============================================================================
+
 MODELS = {
     "Llama-3.1-8B": "meta-llama/Llama-3.1-8B-Instruct",
     "Qwen2.5-7B": "Qwen/Qwen2.5-7B-Instruct",
@@ -37,15 +41,14 @@ MODELS = {
 
 DOMAIN = "US law and bar exam"
 
-# Method configurations
 METHODS = {
     "beam_graph": {
         "name": "Beam+Graph",
-        "type": "graph_gen",  # Special: generates graph in single sequence
+        "type": "graph_gen",
         "sampling_method": "beam_low",
     },
-    "bfs": {
-        "name": "BFS",
+    "graph_explore": {
+        "name": "GraphExplore",
         "type": "exploration",
         "max_depth": 3,
         "sequences_per_node": 4,
@@ -67,12 +70,15 @@ METHODS = {
     },
 }
 
-# Shared params
 CONCEPT_THRESHOLD = 4096
 MAX_SEQ_COUNT = 0
 MAX_LEN = 32
 BATCH_SIZE = 16
 
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
 
 def load_model_with_timing(model_name: str):
     """Load model and return (model, tokenizer, load_time)."""
@@ -99,17 +105,7 @@ def load_model_with_timing(model_name: str):
 
 
 def run_graph_generation(model, tokenizer, model_name: str, save_dir: str):
-    """
-    Method 2.1: Beam search + generate graph in YAML format (single sequence).
-    """
-    
-    prefix = """Generate United States bar exam legal concepts as keywords.
-Please output ONE concept per line.
-Each concept can be multiple words if needed.
-Do not include explanations or extra text.
-Please begin from any random concept.
-Please use English.
-"""
+    """Method: Beam search + generate graph in YAML format (single sequence)."""
     
     save_path = os.path.join(save_dir, f"{model_name}__beam_graph")
     
@@ -119,14 +115,16 @@ Please use English.
     
     start = time.time()
     
-    # Generate single long sequence with beam search
-    messages = [{"role": "user", "content": prefix}]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    prefix_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+    # Get prompt
+    prompt = beam_graph_prompt(DOMAIN)
+    
+    messages = [{"role": "user", "content": prompt}]
+    formatted_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prefix_ids = tokenizer.encode(formatted_prompt, return_tensors="pt").to(model.device)
     
     outputs = model.generate(
         prefix_ids,
-        max_new_tokens=512,  # Longer for full graph
+        max_new_tokens=512,
         num_beams=4,
         temperature=0.7,
         do_sample=False,
@@ -134,12 +132,10 @@ Please use English.
     
     elapsed = time.time() - start
     
-    # Decode
     generated_ids = outputs[0][prefix_ids.shape[1]:]
     text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     
-    # Parse YAML to extract concepts
-    # Simple extraction: lines starting with "- concept:"
+    # Parse concepts
     import re
     concepts = re.findall(r'-\s*concept:\s*([^\n]+)', text)
     concepts = [c.strip() for c in concepts]
@@ -152,7 +148,7 @@ Please use English.
     print(f"✓ Generated graph with {len(concepts)} concepts in {elapsed:.2f}s")
     print(f"✓ Saved to {save_file}")
     
-    metrics = {
+    return {
         'model': model_name,
         'method': 'Beam+Graph',
         'samples': 1,
@@ -168,25 +164,25 @@ Please use English.
         'avg_tokens_per_seq': f"{len(generated_ids):.2f}",
         'gpu_allocated_max': "N/A",
     }
-    
-    return metrics
 
 
-def run_bfs_exploration(model, tokenizer, model_name: str, method_config: dict, save_dir: str):
-    """Method 2.2: BFS hierarchical exploration."""
+def run_graph_exploration(model, tokenizer, model_name: str, method_config: dict, save_dir: str):
+    """Method: Graph exploration with reconnections."""
     
-    save_path = os.path.join(save_dir, f"{model_name}__bfs")
+    save_path = os.path.join(save_dir, f"{model_name}__graph_explore")
     
     print(f"\n{'='*80}")
-    print(f"Method: BFS (hierarchical exploration)")
+    print(f"Method: GraphExplore (graph with reconnections)")
     print(f"{'='*80}")
     
     start = time.time()
     
-    root, concept_map, stats = explore_bfs(
+    root, concept_map, stats = explore_graph(
         model=model,
         tokenizer=tokenizer,
         domain=DOMAIN,
+        root_prompt_fn=graph_root_prompt,
+        child_prompt_fn=graph_child_prompt,
         max_concepts=CONCEPT_THRESHOLD,
         max_depth=method_config['max_depth'],
         sequences_per_node=method_config['sequences_per_node'],
@@ -196,15 +192,14 @@ def run_bfs_exploration(model, tokenizer, model_name: str, method_config: dict, 
     
     elapsed = time.time() - start
     
-    # Extract metrics
-    total_tokens = stats['total_sequences_generated'] * MAX_LEN  # Approximate
+    total_tokens = stats['total_sequences_generated'] * MAX_LEN
     
-    metrics = {
+    return {
         'model': model_name,
-        'method': 'BFS',
+        'method': 'GraphExplore',
         'samples': stats['total_sequences_generated'],
         'valid_concepts': stats['concepts_discovered'],
-        'invalid_concepts': 0,  # BFS doesn't track invalid separately yet
+        'invalid_concepts': 0,
         'invalid_ratio': "N/A",
         'threshold_reached': stats['concepts_discovered'] >= CONCEPT_THRESHOLD,
         'tokens_per_sec': f"{total_tokens / elapsed:.2f}",
@@ -216,24 +211,15 @@ def run_bfs_exploration(model, tokenizer, model_name: str, method_config: dict, 
         'gpu_allocated_max': "N/A",
         'max_depth': stats['max_depth_reached'],
         'nodes_explored': stats['total_nodes_explored'],
+        'reconnections': stats['reconnections'],
     }
-    
-    return metrics
 
 
 def run_flat_sampling(model, tokenizer, model_name: str, method_config: dict, save_dir: str):
-    """Methods 2.3-2.5: Flat sampling with different methods."""
+    """Methods: Flat sampling with different methods."""
     
     sampling_method = method_config['sampling_method']
     method_name = method_config['name']
-    
-    prefix = """Generate United States bar exam legal concepts as keywords.
-Please output ONE concept per line.
-Each concept can be multiple words if needed.
-Do not include explanations or extra text.
-Please begin from any random concept.
-Please use English.
-"""
     
     save_path = os.path.join(save_dir, f"{model_name}__{sampling_method}")
     
@@ -244,9 +230,9 @@ Please use English.
     results = sample_concepts(
         model=model,
         tokenizer=tokenizer,
-        prefix=prefix,
+        prompt_fn=lambda: flat_concept_list(DOMAIN),
         concept_threshold=CONCEPT_THRESHOLD,
-        max_samples=MAX_SEQ_COUNT,
+        max_samples=MAX_SEQ_COUNT if MAX_SEQ_COUNT > 0 else 100000,
         max_len=MAX_LEN,
         batch_size=BATCH_SIZE,
         sampling_method=sampling_method,
@@ -254,10 +240,7 @@ Please use English.
         model_name=model_name,
     )
     
-    # Extract metrics
-    metrics = extract_metrics(results, model_name, method_name)
-    
-    return metrics
+    return extract_metrics(results, model_name, method_name)
 
 
 def extract_metrics(results: dict, model_name: str, method_name: str) -> dict:
@@ -299,16 +282,14 @@ def print_metrics_table(all_metrics: list):
     """Print formatted comparison table."""
     
     print(f"\n{'='*120}")
-    print("EXPERIMENT 2: BASELINE COMPARISON - RESULTS")
+    print("EXPERIMENT 1: BASELINE COMPARISON - RESULTS")
     print(f"Domain: {DOMAIN}")
     print(f"{'='*120}\n")
     
-    # Header
     print(f"{'Model':<15} | {'Method':<15} | {'Samples':>7} | {'Valid':>6} | {'Invalid':>7} | "
           f"{'Ratio':>6} | {'Conv':>5} | {'Time':>7} | {'Tok/s':>8} | {'Con/s':>8}")
     print("-" * 120)
     
-    # Rows
     for m in all_metrics:
         converged = "YES" if m['threshold_reached'] else "NO"
         print(f"{m['model']:<15} | {m['method']:<15} | {m['samples']:>7} | "
@@ -337,12 +318,16 @@ def save_to_csv(all_metrics: list, output_path: str):
     print(f"✓ Saved CSV to {output_path}")
 
 
+# ============================================================================
+# Main
+# ============================================================================
+
 def main():
     """Run experiment 1."""
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = f"results/exp1_baselines_{timestamp}"
+    save_dir = "results/exp1_baselines"
     csv_path = f"{save_dir}/metrics.csv"
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
     
     print(f"{'='*80}")
     print("EXPERIMENT 1: BASELINE COMPARISON")
@@ -357,7 +342,6 @@ def main():
     
     for model_short, model_path in MODELS.items():
         
-        # Load model once
         model, tokenizer, load_time, model_mem = load_model_with_timing(model_path)
         
         for method_key, method_config in METHODS.items():
@@ -368,7 +352,7 @@ def main():
                 if method_type == 'graph_gen':
                     metrics = run_graph_generation(model, tokenizer, model_short, save_dir)
                 elif method_type == 'exploration':
-                    metrics = run_bfs_exploration(model, tokenizer, model_short, method_config, save_dir)
+                    metrics = run_graph_exploration(model, tokenizer, model_short, method_config, save_dir)
                 elif method_type == 'flat':
                     metrics = run_flat_sampling(model, tokenizer, model_short, method_config, save_dir)
                 else:
@@ -385,14 +369,10 @@ def main():
                 import traceback
                 traceback.print_exc()
         
-        # Clean up
         del model
         torch.cuda.empty_cache()
     
-    # Print final table
     print_metrics_table(all_metrics)
-    
-    # Save CSV
     save_to_csv(all_metrics, csv_path)
     
     print(f"\n✓ Experiment 1 complete!")

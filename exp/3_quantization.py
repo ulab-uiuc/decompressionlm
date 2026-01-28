@@ -3,9 +3,7 @@
 Experiment 3: Quantization Ladder
 
 Test decompressionLM with different quantization methods across 4 domains.
-Each config runs twice:
-1. concept_threshold=100 (or configured), max_seq_count=None
-2. concept_threshold=0 (infinity), max_seq_count=4096
+Each config runs once with concept_threshold.
 
 Models: Llama-3.1-8B, Qwen2.5-7B
 Quantizations: BF16, GPTQ_INT8, AWQ_4BIT, GPTQ_INT4, BNB_4BIT
@@ -18,17 +16,19 @@ import time
 import csv
 import torch
 from pathlib import Path
-from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src import sample_concepts
+from exp.prompt_templates import flat_concept_list
+from src.concept_sampling import sample_concepts
 from src.profiling import measure_model_memory
 
 
+# ============================================================================
 # Configuration
+# ============================================================================
+
 MODELS = {
     "Llama-3.1-8B": "meta-llama/Llama-3.1-8B-Instruct",
     "Qwen2.5-7B": "Qwen/Qwen2.5-7B-Instruct",
@@ -49,17 +49,16 @@ DOMAINS = {
     "faa": "FAA regulations and aviation",
 }
 
-# Experiment configs
-RUNS = [
-    {"name": "threshold", "concept_threshold": 4096, "max_seq_count": None},
-    {"name": "full_gen", "concept_threshold": 0, "max_seq_count": 4096},  # 0 = infinity
-]
-
-# Shared params
+# Experiment config
+CONCEPT_THRESHOLD = 4096
 MAX_LEN = 32
 BATCH_SIZE = 16
 SAMPLING_METHOD = "vdc"
 
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
 
 def load_model_with_timing(model_name: str, quant_config: dict):
     """Load model and return (model, tokenizer, load_time)."""
@@ -94,52 +93,26 @@ def run_experiment(
     quant_name: str,
     domain_name: str,
     domain_prompt: str,
-    run_config: dict,
     save_dir: str,
 ):
     """Run single experiment configuration."""
     
-    concept_threshold = run_config["concept_threshold"]
-    max_seq_count = run_config["max_seq_count"]
-    run_name = run_config["name"]
-    
-    # Build prompt - STRICT FORMAT
-    if domain_name == "us_law":
-        prefix = """Generate United States bar exam legal concepts as keywords.
-Please output ONE concept per line.
-Each concept can be multiple words if needed.
-Do not include explanations or extra text.
-Please begin from any random concept.
-Please use English.
-"""
-    else:
-        # For other domains, adapt the format
-        prefix = f"""Generate {domain_prompt} concepts as keywords.
-Please output ONE concept per line.
-Each concept can be multiple words if needed.
-Do not include explanations or extra text.
-Please begin from any random concept.
-Please use English.
-"""
-    
     # Save path
-    save_name = f"{model_name}__{quant_name}__{domain_name}__{run_name}"
+    save_name = f"{model_name}__{quant_name}__{domain_name}"
     save_path = os.path.join(save_dir, save_name)
     
     print(f"\n{'='*80}")
     print(f"Running: {save_name}")
     print(f"{'='*80}")
-    print(f"Threshold: {concept_threshold if concept_threshold > 0 else 'INFINITY (disabled)'}")
-    print(f"Max sequences: {max_seq_count if max_seq_count else 'None'}")
+    print(f"Threshold: {CONCEPT_THRESHOLD}")
     
-    # Run sampling (model loading time NOT counted)
-    # If threshold=0, it means infinity - just use max_seq_count as stopping condition
+    # Run sampling
     results = sample_concepts(
         model=model,
         tokenizer=tokenizer,
-        prefix=prefix,
-        concept_threshold=concept_threshold,  # Pass 0 directly, let sample_concepts handle it
-        max_samples=max_seq_count if max_seq_count else 100000,
+        prompt_fn=lambda: flat_concept_list(domain_prompt),
+        concept_threshold=CONCEPT_THRESHOLD,
+        max_samples=100000,
         max_len=MAX_LEN,
         batch_size=BATCH_SIZE,
         sampling_method=SAMPLING_METHOD,
@@ -148,12 +121,12 @@ Please use English.
     )
     
     # Extract metrics
-    metrics = extract_metrics(results, model_name, quant_name, domain_name, run_name)
+    metrics = extract_metrics(results, model_name, quant_name, domain_name)
     
     return metrics
 
 
-def extract_metrics(results: dict, model_name: str, quant_name: str, domain_name: str, run_name: str) -> dict:
+def extract_metrics(results: dict, model_name: str, quant_name: str, domain_name: str) -> dict:
     """Extract all metrics from results."""
     
     prof = results.get('profiling', {})
@@ -170,16 +143,11 @@ def extract_metrics(results: dict, model_name: str, quant_name: str, domain_name
     total_raw_concepts = results['valid_concepts'] + results['invalid_concepts']
     invalid_ratio = results['invalid_concepts'] / total_raw_concepts if total_raw_concepts > 0 else 0
     
-    # Graph metrics (if available)
-    # Note: We need to compute graph from sequences
-    # For now, placeholder - will add graph computation
-    
     metrics = {
         # Identifiers
         'model': model_name,
         'quantization': quant_name,
         'domain': domain_name,
-        'run': run_name,
         
         # Core counts
         'samples': samples_done,
@@ -221,32 +189,22 @@ def print_metrics_table(all_metrics: list):
         return
     
     print(f"\n{'='*120}")
-    print("EXPERIMENT 1: QUANTIZATION LADDER - RESULTS")
+    print("EXPERIMENT 3: QUANTIZATION LADDER - RESULTS")
     print(f"{'='*120}\n")
     
-    # Group by run type
-    for run_name in ["threshold", "full_gen"]:
-        run_metrics = [m for m in all_metrics if m['run'] == run_name]
-        
-        if not run_metrics:
-            continue
-        
-        print(f"\n{run_name.upper().replace('_', ' ')}")
-        print("-" * 120)
-        
-        # Header
-        print(f"{'Model':<15} | {'Quant':<10} | {'Domain':<10} | {'Samples':>7} | "
-              f"{'Valid':>6} | {'Invalid':>7} | {'Ratio':>6} | {'Conv':>5} | "
-              f"{'Time':>7} | {'Tok/s':>7} | {'Con/s':>7}")
-        print("-" * 120)
-        
-        # Rows
-        for m in run_metrics:
-            converged = "YES" if m['threshold_reached'] else "NO"
-            print(f"{m['model']:<15} | {m['quantization']:<10} | {m['domain']:<10} | "
-                  f"{m['samples']:>7} | {m['valid_concepts']:>6} | {m['invalid_concepts']:>7} | "
-                  f"{m['invalid_ratio']:>6} | {converged:>5} | "
-                  f"{m['total_time']:>7}s | {m['tokens_per_sec']:>7} | {m['concepts_per_sec']:>7}")
+    # Header
+    print(f"{'Model':<15} | {'Quant':<10} | {'Domain':<10} | {'Samples':>7} | "
+          f"{'Valid':>6} | {'Invalid':>7} | {'Ratio':>6} | {'Conv':>5} | "
+          f"{'Time':>7} | {'Tok/s':>7} | {'Con/s':>7}")
+    print("-" * 120)
+    
+    # Rows
+    for m in all_metrics:
+        converged = "YES" if m['threshold_reached'] else "NO"
+        print(f"{m['model']:<15} | {m['quantization']:<10} | {m['domain']:<10} | "
+              f"{m['samples']:>7} | {m['valid_concepts']:>6} | {m['invalid_concepts']:>7} | "
+              f"{m['invalid_ratio']:>6} | {converged:>5} | "
+              f"{m['total_time']:>7}s | {m['tokens_per_sec']:>7} | {m['concepts_per_sec']:>7}")
     
     print(f"\n{'='*120}\n")
 
@@ -269,12 +227,16 @@ def save_to_csv(all_metrics: list, output_path: str):
     print(f"✓ Saved CSV to {output_path}")
 
 
+# ============================================================================
+# Main
+# ============================================================================
+
 def main():
     """Run experiment 3."""
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = f"results/exp3_quantization_{timestamp}"
+    save_dir = "results/exp3_quantization"
     csv_path = f"{save_dir}/metrics.csv"
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
     
     print(f"{'='*80}")
     print("EXPERIMENT 3: QUANTIZATION LADDER")
@@ -282,8 +244,8 @@ def main():
     print(f"Models: {list(MODELS.keys())}")
     print(f"Quantizations: {list(QUANTIZATIONS.keys())}")
     print(f"Domains: {list(DOMAINS.keys())}")
-    print(f"Runs per config: {len(RUNS)}")
-    print(f"Total experiments: {len(MODELS) * len(QUANTIZATIONS) * len(DOMAINS) * len(RUNS)}")
+    print(f"Concept threshold: {CONCEPT_THRESHOLD}")
+    print(f"Total experiments: {len(MODELS) * len(QUANTIZATIONS) * len(DOMAINS)}")
     print(f"Save directory: {save_dir}")
     print(f"{'='*80}\n")
     
@@ -297,26 +259,25 @@ def main():
             model, tokenizer, load_time, model_mem = load_model_with_timing(model_path, quant_config)
             
             for domain_name, domain_prompt in DOMAINS.items():
-                for run_config in RUNS:
+                
+                try:
+                    metrics = run_experiment(
+                        model, tokenizer,
+                        model_short, quant_name,
+                        domain_name, domain_prompt,
+                        save_dir
+                    )
                     
-                    try:
-                        metrics = run_experiment(
-                            model, tokenizer,
-                            model_short, quant_name,
-                            domain_name, domain_prompt,
-                            run_config, save_dir
-                        )
-                        
-                        all_metrics.append(metrics)
-                        
-                        # Print after each run
-                        print(f"\n✓ Completed: {model_short}/{quant_name}/{domain_name}/{run_config['name']}")
-                        print(f"  Samples: {metrics['samples']}, Valid: {metrics['valid_concepts']}, "
-                              f"Invalid: {metrics['invalid_concepts']}, Time: {metrics['total_time']}s")
-                        
-                    except Exception as e:
-                        print(f"\n✗ Failed: {model_short}/{quant_name}/{domain_name}/{run_config['name']}")
-                        print(f"  Error: {e}")
+                    all_metrics.append(metrics)
+                    
+                    # Print after each run
+                    print(f"\n✓ Completed: {model_short}/{quant_name}/{domain_name}")
+                    print(f"  Samples: {metrics['samples']}, Valid: {metrics['valid_concepts']}, "
+                          f"Invalid: {metrics['invalid_concepts']}, Time: {metrics['total_time']}s")
+                    
+                except Exception as e:
+                    print(f"\n✗ Failed: {model_short}/{quant_name}/{domain_name}")
+                    print(f"  Error: {e}")
             
             # Clean up model
             del model
