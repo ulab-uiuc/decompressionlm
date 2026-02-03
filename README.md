@@ -26,7 +26,7 @@ results = estimate_prefix_mass(
     model=model,  # by default, you can load the model in torch.bfloat16
     tokenizer=tokenizer,
     prefix=prompt,
-    prefix_len=16,  # please leave this as-is; it is kept for consistency with the paper
+    prefix_len=16,  # please leave this as-is; it is not used since it is disabled by prob_threshold=1.0
     max_len=16,
     max_samples=8192,
     prob_threshold=1.0,  # disabled, as it is not used in this paper
