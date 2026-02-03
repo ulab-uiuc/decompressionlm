@@ -188,6 +188,8 @@ To reproduce the experiments reported in our paper, the scripts you will need ar
 3. `03_perplexity_16.py` – Concept understanding via perplexity
 4. `04_mmlu.py` – Hallucination verification (22 models ranked by MMLU-Pro Law)
 
+Other scripts in this `exp/` directory helps to print out the results in a more readable, more compact, form of tables.
+
 Each individual experiment will be saved in the `results/` directory once it finishes. It is therefore fine if a script is interrupted midway; when rerun, it will skip experiments that have already completed.
 
 Some models may be gated, so please remember to log in to your Hugging Face CLI (`hf auth`).
