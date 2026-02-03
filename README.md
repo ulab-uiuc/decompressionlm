@@ -3,27 +3,6 @@
 Zero-shot concept graph extraction from LLMs using deterministic arithmetic sampling,  
 in order to discovers what language models encode [![arXiv](https://img.shields.io/badge/arXiv-2602.00377-b31b1b.svg)](https://arxiv.org/abs/2602.00377)
 
-## Quick Start
-
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.bin_entropy import estimate_prefix_mass
-
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B-Instruct", device_map="auto")
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
-
-results = estimate_prefix_mass(
-    model=model,
-    tokenizer=tokenizer,
-    prefix="Generate US federal aviation law concepts as keywords. ONE concept per line.",
-    prefix_len=16,
-    prob_threshold=1.0,
-    max_samples=8192,
-    max_len=32,
-    save_path="results/faa_concepts"
-)
-```
-
 ## Core API
 
 `estimate_prefix_mass()` - Main sampling function
