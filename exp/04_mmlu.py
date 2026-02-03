@@ -34,7 +34,7 @@ from typing import Dict, List, Tuple, Optional
 MODELS = [
     # "google/gemma-2-27b-it", # at most 16B, this is too large
     "google/gemma-2-9b-it",
-    # "mistralai/Mistral-Small-Instruct-2409",
+    # "mistralai/Mistral-Small-Instruct-2409", # at most 16B, this is too large
     "mistralai/Mistral-Nemo-Instruct-2407",
     "microsoft/Phi-3.5-mini-instruct",
     "Qwen/Qwen2-7B-Instruct",
