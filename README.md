@@ -12,6 +12,8 @@ to discover what language models encode in the form of concept graphs [![arXiv](
 </div>
 
 ## Test Your Model
+
+### How to
 ```python
 prompt = """Generate United States bar exam legal concepts as keywords.
 
@@ -44,9 +46,130 @@ results = estimate_prefix_mass(
 
 Please keep in mind that, because of our custom implementation of sampling, some models with different KV cache specifications might not work out of the box and may throw confusing errors. In the worst case, you might need to modify the code in `src/arithmetic.py` around line 96, where the variable `is_gemma` can be used to disable the KV cache when set to `True`. This overrides KV cache issues but may be slower.
 
+### What you will get
+
+<details>
+  <summary><b>Example</b></summary>
+  <pre>================================================================================
+GRAPH ANALYSIS
+================================================================================
+
+Concept Extraction:
+  Total concepts extracted   : 25933
+  Unique before merging      : 1621
+  Unique after merging       : 985
+  Total raw edges            : 17741
+
+Graph Statistics:
+  Nodes (concepts)           : 809
+  Edges (relations)          : 3273
+  Graph density              : 0.005007098361257634
+  Average degree             : 8.091470951792337
+
+Node Connectivity:
+  Orphan nodes (degree=0)    : 0 (0.0%)
+  Weakly connected (deg≤1)   : 198 (24.5%)
+  Well connected (deg>1)     : 611 (75.5%)
+
+Graph Structure:
+  Connected components       : 6
+  Largest component          : 788 nodes (97.4%)
+  Largest component density  : 0.005251904359548243
+
+================================================================================
+📄 Loaded from file (not recomputed)
+
+================================================================================
+
+Interactive viewer ready. Type 'help' for commands.
+
+\>\>\> concepts
+
+================================================================================
+FINAL GRAPH CONCEPTS (after filtering & merging)
+
+================================================================================
+Total concepts extracted   : 25933
+Unique before merging      : 1621
+Unique after merging       : 985
+Merge reduction            : 39.2%
+
+Final graph nodes          : 809
+
+Top 64 most connected concepts:
+   1. (degree=247) contractlaw
+   2. (degree=190) realproperty
+   3. (degree=189) intellectualproperty
+   4. (degree=166) evidence
+   5. (degree=152) criminallaw
+   6. (degree=132) constitutionallaw
+   7. (degree=129) criminalprocedur
+   8. (degree=121) familylaw
+   9. (degree=116) legal ethic
+  10. (degree=113) habeas corpu
+  11. (degree=104) tort
+  12. (degree= 95) professionalresponsibility
+  13. (degree= 92) civ procedure
+  14. (degree= 90) statutesoflimitation
+  15. (degree= 85) equity
+  16. (degree= 81) eminentdomain
+  17. (degree= 79) tortlaw
+  18. (degree= 71) evidencelaw
+  19. (degree= 65) propertylaw
+  20. (degree= 60) contract
+  21. (degree= 60) liability
+  22. (degree= 56) mens rea
+  23. (degree= 54) negligence
+  24. (degree= 53) appellate procedure
+  25. (degree= 49) mergers and acquisition
+  26. (degree= 49) habitual resident
+  27. (degree= 49) tortfeasor
+  28. (degree= 49) strict liability
+  29. (degree= 48) contract formation
+  30. (degree= 47) real estate
+  31. (degree= 46) equitable estoppel
+  32. (degree= 45) statutory interpretation
+  33. (degree= 45) standing
+  34. (degree= 44) realestatelaw
+  35. (degree= 44) attorneyclientprivilege
+  36. (degree= 43) equitable remedy
+  37. (degree= 42) due proces
+  38. (degree= 41) trustsandestate
+  39. (degree= 41) conflict of law
+  40. (degree= 40) evidentiary rule
+  41. (degree= 40) lien
+  42. (degree= 39) ethic
+  43. (degree= 39) equal protection
+  44. (degree= 36) causation
+  45. (degree= 35) willsandtrust
+  46. (degree= 33) administrative law
+  47. (degree= 32) realpropertylaw
+  48. (degree= 32) mortgage
+  49. (degree= 31) moot court
+  50. (degree= 31) habitualoffender
+  51. (degree= 30) estoppel
+  52. (degree= 30) res judicata
+  53. (degree= 28) hearsay
+  54. (degree= 28) corporatelaw
+  55. (degree= 28) legal malpractice
+  56. (degree= 27) property
+  57. (degree= 25) constitution
+  58. (degree= 25) business organization
+  59. (degree= 25) jurisdiction
+  60. (degree= 24) mers system
+  61. (degree= 24) estate planning
+  62. (degree= 24) mental capacity
+  63. (degree= 23) evidencerule
+  64. (degree= 23) statute of fraud
+================================================================================</pre>
+</details>
+
+
+This is an example of what you could get when testing a model on US bar exam concepts, with the `interactive viewer` mentioned below.
+
 ## Experiments
 
-To run the experiments:
+To run the experiments as in the paper:
 
 ```bash
 python -m exp.01_quantization
